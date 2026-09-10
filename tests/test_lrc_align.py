@@ -545,27 +545,35 @@ class DistinctTagTests(unittest.TestCase):
         self.assertEqual(out, [1.0, 1.5, 2.0])
 
     def test_compression_after_finalize_keeps_tags_distinct(self):
-        # Regression: finalize spaces words by the minimum step, then the span
-        # cap scales the line down and used to collapse those gaps to zero.
+        # Regression for the collapsed-timestamp bug: finalize spaces packed
+        # words by the minimum step, then the span cap scales the line down
+        # (six words 10 ms apart followed by eight words 3 s apart is far wider
+        # than the song's pace allows). Before the fix that shrank the 10 ms
+        # gaps below the printed resolution: three pairs printed identical.
         text = "".join(f"[00:{10 + 3 * k:02d}.00] w{k}a w{k}b w{k}c\n" for k in range(6))
-        text += "[00:28.00] " + " ".join(f"t{i}" for i in range(14)) + "\n[00:29.50] next line\n"
+        text += "[00:28.00] " + " ".join(f"t{i}" for i in range(14)) + "\n[00:58.00] next line\n"
         lines = la.parse_lrc(text)
-        base = context_align(lines, words_per_second=3.0)
+        by = {la.clean_text(l): l.start for l in lines if l.is_lyric}
 
         def fn(start, end, txt):
-            words = base(start, end, txt)
-            # The long line: words packed at exactly the minimum step, then far apart
-            out = []
-            for w, s_, e_, p in words:
-                if w.startswith("t"):
-                    i = int(w[1:])
-                    s_ = 28.0 + (i * la.MIN_WORD_STEP if i < 10 else 20.0 + i)
-                    e_ = s_ + 0.01
-                out.append((w, s_, e_, p))
-            return out
+            res = []
+            for piece in txt.split("\n"):
+                t0 = by.get(piece.strip(), start)
+                for j, w in enumerate(piece.split()):
+                    if w.startswith("t"):
+                        i = int(w[1:])
+                        s_ = 28.0 + (i * 0.01 if i < 6 else 0.05 + 3.0 * (i - 5))
+                    else:
+                        s_ = t0 + j / 3.0
+                    res.append((w, s_, s_ + 0.01, .9))
+            return res
         out, stats = la.convert_lines(lines, fn, audio_duration=200.0)
         self.assert_distinct(out)
-        self.assertGreaterEqual(stats.lines_forced, 1)
+        self.assertEqual(stats.lines_forced, 1)
+        # The compression itself still happened (the line is far shorter than
+        # the 21 s the aligner claimed), so the cap was not simply widened.
+        vals = [la.parse_timestamp(*m.groups()) for m in la.WORD_TS_RE.finditer(out[6])]
+        self.assertLess(vals[-1] - vals[0], 15.0)
 
     def test_fourteen_words_in_a_short_window(self):
         # 14 words with only 0.1 s before the next line: 7 ms apart is below
