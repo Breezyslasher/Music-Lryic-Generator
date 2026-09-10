@@ -54,7 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--audio", help="Folder containing the audio files (starts the GUI when omitted)")
     p.add_argument("--lyrics", help="Folder containing the .lrc files (default: same as --audio)")
     p.add_argument("--output", help="Folder to write converted .lrc files (default: in place, originals kept as .lrc.bak)")
-    p.add_argument("--model", default="base", choices=MODELS, help="Whisper model to use for alignment")
+    p.add_argument("--model", default="base",
+                   help="Whisper model name (" + ", ".join(MODELS) + ") or path to a downloaded .pt file")
     p.add_argument("--language", default="en", help="Lyric language code, or 'auto' to detect per song")
     p.add_argument("--device", default=None, help="Force 'cpu' or 'cuda' (default: auto)")
     p.add_argument("-r", "--recursive", action="store_true", help="Search sub-folders too")
@@ -107,8 +108,8 @@ def run_gui() -> None:
 
             opts = ttk.Frame(frm)
             opts.pack(fill=tk.X, pady=(10, 4))
-            ttk.Label(opts, text="Whisper model:").pack(side=tk.LEFT)
-            ttk.Combobox(opts, textvariable=self.model_var, state="readonly", values=MODELS, width=10
+            ttk.Label(opts, text="Whisper model (name or path to .pt):").pack(side=tk.LEFT)
+            ttk.Combobox(opts, textvariable=self.model_var, values=MODELS, width=14
                          ).pack(side=tk.LEFT, padx=(4, 16))
             ttk.Label(opts, text="Language:").pack(side=tk.LEFT)
             ttk.Combobox(opts, textvariable=self.language_var, values=LANGUAGES, width=8

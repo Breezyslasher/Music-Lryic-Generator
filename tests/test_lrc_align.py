@@ -162,6 +162,31 @@ class FinalizeTests(unittest.TestCase):
         times, _ = la.finalize_word_times([1.0, 8.0, 9.0], 1.0, 2.0)
         self.assertTrue(all(t < 2.0 for t in times))
         self.assertLess(times[1], times[2])
+        # Overflowing words are spread through the gap, not stacked 0.01s apart.
+        self.assertGreater(times[2] - times[1], 0.3)
+
+    def test_tied_words_are_spread_forward(self):
+        times, _ = la.finalize_word_times([1.0, 1.0, 1.0, 2.0], 1.0, 3.0)
+        self.assertEqual([round(t, 3) for t in times], [1.0, 1.333, 1.667, 2.0])
+
+    def test_words_before_line_start_are_spread(self):
+        times, _ = la.finalize_word_times([0.2, 0.5, 0.9, 2.0], 1.0, 3.0)
+        self.assertEqual([round(t, 3) for t in times], [1.0, 1.333, 1.667, 2.0])
+
+    def test_trailing_words_past_window_are_spread_backward(self):
+        times, _ = la.finalize_word_times([1.0, 5.0, 5.0, 5.0], 1.0, 2.0)
+        self.assertEqual([round(t, 3) for t in times], [1.0, 1.33, 1.66, 1.99])
+
+    def test_out_of_order_words_are_smoothed(self):
+        times, _ = la.finalize_word_times([1.0, 1.9, 1.5, 2.5], 1.0, 4.0)
+        self.assertEqual([round(t, 3) for t in times], [1.0, 1.7, 2.1, 2.5])
+        for a, b in zip(times, times[1:]):
+            self.assertGreater(b, a)
+
+    def test_pool_adjacent_violators(self):
+        self.assertEqual(la.pool_adjacent_violators([1, 3, 2, 4]), [1, 2.5, 2.5, 4])
+        self.assertEqual(la.pool_adjacent_violators([3, 2, 1]), [2, 2, 2])
+        self.assertEqual(la.pool_adjacent_violators([1, 2, 3]), [1, 2, 3])
 
 
 class ConvertTests(unittest.TestCase):

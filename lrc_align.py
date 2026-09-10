@@ -46,6 +46,9 @@ SAMPLE_RATE = 16000
 MAX_LINE_WINDOW = 30.0
 # Audio included before the line timestamp so a clipped first consonant is not lost.
 LEAD_PAD = 0.15
+# Audio included after the next line's timestamp so ad-libs that overlap the
+# next line can still be placed where they are sung.
+TAIL_PAD = 0.5
 # Minimum spacing enforced between consecutive word tags.
 MIN_WORD_STEP = 0.01
 # Rough spoken/sung duration per word used when alignment fails for a line.
@@ -272,19 +275,64 @@ def finalize_word_times(
         else:
             i += 1
 
-    prev = line_start
-    out[0] = line_start
+    # Clamp into the window, make the sequence non-decreasing, then spread any
+    # words that ended up on top of each other evenly between their neighbours.
+    upper = None if line_end is None else max(line_end - MIN_WORD_STEP, line_start)
+    clamped = [max(float(t), line_start) if upper is None else min(max(float(t), line_start), upper)
+               for t in filled]
+    clamped[0] = line_start
+    out = spread_ties(pool_adjacent_violators(clamped), line_start, line_end)
     for k in range(1, n):
-        t = float(filled[k])
-        t = max(t, prev + MIN_WORD_STEP)
-        if line_end is not None:
-            # Leave room for the words that still follow this one.
-            upper = line_end - MIN_WORD_STEP * (n - k)
-            if t > upper:
-                t = max(upper, prev + MIN_WORD_STEP)
-        out[k] = t
-        prev = t
+        if out[k] <= out[k - 1]:
+            out[k] = out[k - 1] + MIN_WORD_STEP
     return out, False
+
+
+def pool_adjacent_violators(values: Sequence[float]) -> List[float]:
+    """Smallest change that makes ``values`` non-decreasing (isotonic regression)."""
+    blocks: List[List[float]] = []  # [sum, count]
+    for v in values:
+        blocks.append([v, 1])
+        while len(blocks) > 1 and blocks[-2][0] / blocks[-2][1] > blocks[-1][0] / blocks[-1][1]:
+            s, c = blocks.pop()
+            blocks[-1][0] += s
+            blocks[-1][1] += c
+    out: List[float] = []
+    for s, c in blocks:
+        out.extend([s / c] * c)
+    return out
+
+
+def spread_ties(values: Sequence[float], line_start: float, line_end: Optional[float]) -> List[float]:
+    """Words sharing one timestamp get spaced evenly up to the next distinct time.
+
+    A trailing group (words pushed against the end of the window) is spaced
+    backwards from the previous word instead so the words stay in the gap.
+    """
+    n = len(values)
+    out = list(values)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and abs(values[j + 1] - values[i]) < 1e-9:
+            j += 1
+        size = j - i + 1
+        if size > 1:
+            v = values[i]
+            if j + 1 < n:
+                nxt = values[j + 1]
+                for k in range(i, j + 1):
+                    out[k] = v + (nxt - v) * (k - i) / size
+            elif i > 0:
+                prev = out[i - 1]
+                for k in range(i, j + 1):
+                    out[k] = prev + (v - prev) * (k - i + 1) / size
+            else:
+                span = (line_end - v) if line_end is not None else FALLBACK_SECONDS_PER_WORD * size
+                for k in range(i, j + 1):
+                    out[k] = v + span * (k - i) / size
+        i = j + 1
+    return out
 
 
 def build_word_line(tag: str, tokens: Sequence[str], times: Sequence[float], decimals: int = 2) -> str:
@@ -346,6 +394,9 @@ def convert_lines(
         if should_stop and should_stop():
             raise InterruptedError("stopped")
         start, end = windows[idx]
+        end += TAIL_PAD
+        if audio_duration is not None:
+            end = min(end, max(audio_duration, start + MIN_WORD_STEP * 2))
         tokens = tokenize(line.text)
         try:
             aligned = align_fn(max(0.0, start - LEAD_PAD), end, line.text)
@@ -475,8 +526,27 @@ class WhisperLineAligner:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
         self.model = stable_whisper.load_model(model_name, device=self.device, download_root=download_root)
+        self._apply_alignment_heads(model_name)
         self.audio = None
         self.audio_duration = 0.0
+
+    def _apply_alignment_heads(self, model_name: str) -> None:
+        """Models loaded from a file path miss whisper's tuned alignment heads.
+
+        Whisper only applies them when loading by name, so look them up from
+        the file stem (``base.en.pt`` -> ``base.en``) and apply them ourselves.
+        """
+        path = Path(model_name)
+        if not path.suffix.lower() == ".pt":
+            return
+        try:
+            from whisper import _ALIGNMENT_HEADS
+
+            heads = _ALIGNMENT_HEADS.get(path.stem)
+            if heads is not None:
+                self.model.set_alignment_heads(heads)
+        except Exception:  # noqa: BLE001 - keep working with the default heads
+            pass
 
     def set_audio(self, audio) -> None:
         self.audio = audio

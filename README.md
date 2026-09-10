@@ -82,7 +82,7 @@ The first run downloads the Whisper model.
 | `--audio DIR` | folder with the audio files (required for CLI mode) |
 | `--lyrics DIR` | folder with the `.lrc` files (default: the audio folder) |
 | `--output DIR` | output folder (default: in place, originals kept as `.lrc.bak`) |
-| `--model NAME` | `tiny`, `base`, `small`, `medium`, `large`, `large-v3`, `turbo` (default `base`) |
+| `--model NAME` | `tiny`, `base`, `small`, `medium`, `large`, `large-v3`, `turbo` (default `base`), or the path to a downloaded `.pt` model file |
 | `--language CODE` | lyric language, or `auto` to detect per song (default `en`) |
 | `--device cpu|cuda` | force a device (default: auto) |
 | `-r`, `--recursive` | include sub-folders; the folder structure is mirrored in the output |
@@ -102,6 +102,12 @@ matching audio are skipped and listed in the log.
   word-by-word, including previous output, are skipped.
 - Loud instrumentals make alignment harder. Lines that fell back to even
   spacing are counted in the log so you can check them.
+- Each line is aligned against the audio from its own timestamp to half a
+  second past the next line's timestamp, so ad-libs that overlap the next line
+  can land where they are sung. Word times are never earlier than the line's
+  own timestamp.
+- Speed: on a CPU the `base` model takes roughly a minute for a five minute
+  song with dense lyrics. A GPU is many times faster.
 
 ## Troubleshooting
 
