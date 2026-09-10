@@ -668,6 +668,22 @@ class ProcessLibraryTests(unittest.TestCase):
             self.assertEqual((music / "Line.lrc.bak").read_text(), LINE_FILE)
             self.assertTrue(la.is_word_level(la.parse_lrc((music / "Line.lrc").read_text())))
 
+    def test_backup_survives_mount_without_metadata_support(self):
+        import shutil as _shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "a.lrc", Path(tmp) / "a.lrc.bak"
+            src.write_text("x")
+            real = _shutil.copy2
+
+            def refuse(*a, **k):
+                raise OSError(95, "Operation not supported")
+            _shutil.copy2 = refuse
+            try:
+                la.backup_file(src, dst)
+            finally:
+                _shutil.copy2 = real
+            self.assertEqual(dst.read_text(), "x")
+
     def test_stop_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             music = Path(tmp)

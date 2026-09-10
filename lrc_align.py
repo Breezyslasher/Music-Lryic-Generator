@@ -1017,6 +1017,20 @@ def stamp_provenance(out_lines: Sequence[str]) -> List[str]:
     return [f"[re:{' '.join(fields)}]"] + kept
 
 
+def backup_file(src: Path, dst: Path) -> None:
+    """Copy ``src`` to ``dst``, contents only.
+
+    ``shutil.copy2`` also copies permissions and timestamps, which network
+    mounts such as gvfs SMB shares reject with "Operation not supported".
+    """
+    try:
+        shutil.copy2(src, dst)
+    except OSError:
+        if dst.exists():
+            dst.unlink()
+        shutil.copyfile(src, dst)
+
+
 def convert_file(
     lrc_path: Path,
     audio_path: Path,
@@ -1050,7 +1064,7 @@ def convert_file(
     if output_path.resolve() == lrc_path.resolve():
         backup = lrc_path.with_suffix(lrc_path.suffix + ".bak")
         if not backup.exists():
-            shutil.copy2(lrc_path, backup)
+            backup_file(lrc_path, backup)
     newline = "\r\n" if "\r\n" in content else "\n"
     output_path.write_text(newline.join(new_lines) + newline, encoding="utf-8")
     return FileResult(lrc_path, "converted", output=output_path, audio=audio_path, stats=stats,
