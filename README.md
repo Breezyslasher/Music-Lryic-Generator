@@ -102,10 +102,16 @@ matching audio are skipped and listed in the log.
   word-by-word, including previous output, are skipped.
 - Loud instrumentals make alignment harder. Lines that fell back to even
   spacing are counted in the log so you can check them.
-- Each line is aligned against the audio from its own timestamp to half a
-  second past the next line's timestamp, so ad-libs that overlap the next line
-  can land where they are sung. Word times are never earlier than the line's
-  own timestamp.
+- Each line is aligned together with the lines just before and after it, so
+  its first and last words are not sitting at the edge of the audio slice
+  where Whisper tends to misplace them.
+- Line timestamps in lyric files are often a few tenths of a second early, so
+  the player flips to the next line while the last word is still being sung.
+  By default the tool moves each line's timestamp to where its first word is
+  actually sung, at most 0.3 s earlier or 0.5 s later than the original. Every
+  word of a line is kept before the next line's timestamp so nothing gets
+  skipped. Untick the option in the GUI or pass `--keep-line-times` to leave
+  line timestamps exactly as they were.
 - Speed: on a CPU the `base` model takes roughly a minute for a five minute
   song with dense lyrics. A GPU is many times faster.
 
