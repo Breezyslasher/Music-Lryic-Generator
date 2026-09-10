@@ -44,7 +44,7 @@ def run_cli(args: argparse.Namespace) -> int:
     summary = lrc_align.process_library(
         audio_dir, lyrics_dir, output_dir, aligner,
         language=args.language, recursive=args.recursive, log=print,
-        retime_lines=not args.keep_line_times,
+        retime_lines=not args.keep_line_times, reconvert=args.reconvert,
     )
     print("Done: " + summary.describe())
     return 0 if summary.count("failed") == 0 else 1
@@ -60,6 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--language", default="en", help="Lyric language code, or 'auto' to detect per song")
     p.add_argument("--device", default=None, help="Force 'cpu' or 'cuda' (default: auto)")
     p.add_argument("-r", "--recursive", action="store_true", help="Search sub-folders too")
+    p.add_argument("--reconvert", action="store_true",
+                   help="Also redo files this tool converted before (from their .lrc.bak); "
+                        "word-by-word files from other sources are still left alone")
     p.add_argument("--keep-line-times", action="store_true",
                    help="Keep the original line timestamps instead of moving them to the sung first word")
     return p
@@ -85,6 +88,7 @@ def run_gui() -> None:
             self.language_var = tk.StringVar(value="en")
             self.recursive_var = tk.BooleanVar(value=False)
             self.retime_var = tk.BooleanVar(value=True)
+            self.reconvert_var = tk.BooleanVar(value=False)
             self.status_text = tk.StringVar(
                 value="Pick the folder with your songs. Lyrics/output default to the same folder.")
             self.stop_event = threading.Event()
@@ -121,6 +125,8 @@ def run_gui() -> None:
             ttk.Checkbutton(opts, text="Include sub-folders", variable=self.recursive_var).pack(side=tk.LEFT)
             ttk.Checkbutton(frm, text="Move line timestamps to where the first word is sung (recommended)",
                             variable=self.retime_var).pack(anchor=tk.W, pady=(0, 4))
+            ttk.Checkbutton(frm, text="Re-do files this tool converted before (uses the .lrc.bak originals)",
+                            variable=self.reconvert_var).pack(anchor=tk.W, pady=(0, 4))
 
             btns = ttk.Frame(frm)
             btns.pack(pady=10)
@@ -240,6 +246,7 @@ def run_gui() -> None:
                     log=self.log, progress=self.set_progress,
                     should_stop=self.stop_event.is_set,
                     retime_lines=self.retime_var.get(),
+                    reconvert=self.reconvert_var.get(),
                 )
                 self.log("Done: " + summary.describe())
                 self.set_status("Finished: " + summary.describe())

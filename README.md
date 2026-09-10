@@ -86,6 +86,7 @@ The first run downloads the Whisper model.
 | `--language CODE` | lyric language, or `auto` to detect per song (default `en`) |
 | `--device cpu|cuda` | force a device (default: auto) |
 | `-r`, `--recursive` | include sub-folders; the folder structure is mirrored in the output |
+| `--reconvert` | also redo files this tool converted before (recognised by their `[re:lrc-align ...]` tag), from the `.lrc.bak` original; word-by-word files from any other source are still left alone. Use after updating the tool. |
 
 ### Matching lyrics to audio
 
