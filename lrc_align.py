@@ -124,7 +124,7 @@ def cap_line_span(times: List[float], n_words: Optional[int] = None, pace: Optio
 # tagged a little early, while the aligner hears long sustained first notes a
 # little late, so the bounds are deliberately tight.
 MAX_EARLY_SHIFT = 0.3
-MAX_LATE_SHIFT = 0.35
+MAX_LATE_SHIFT = 0.6
 # Measured against a professionally timed file, the aligner hears the first
 # word of a line this much later than it really starts.
 FIRST_WORD_BIAS = 0.12

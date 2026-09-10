@@ -124,7 +124,7 @@ matching audio are skipped and listed in the log.
   the player flips to the next line while the last word is still being sung.
   When a file as a whole runs early, the tool moves each early line's
   timestamp later to where its first word is actually sung, by at most
-  0.35 s. Timestamps are never moved earlier, and files whose timestamps
+  0.6 s. Timestamps are never moved earlier, and files whose timestamps
   already match the vocals are left exactly as they are. Every word of a
   line is kept before the next line's timestamp so nothing gets skipped.
   Untick the option in the GUI or pass `--keep-line-times` to leave line
