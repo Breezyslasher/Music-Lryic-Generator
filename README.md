@@ -70,6 +70,10 @@ command above installs CPU PyTorch.
 4. Pick a Whisper model and language, tick "Include sub-folders" for a whole
    library, then press **Start Conversion**. **Stop** finishes the current file
    and halts.
+5. After a run, tick "Only files flagged in a report" and pick a bigger model
+   to redo just the flagged songs; leave the report path blank to use the
+   report in the output folder. "Re-do files this tool converted before"
+   redoes everything this tool wrote, for use after updating the tool.
 
 The first run downloads the Whisper model.
 
