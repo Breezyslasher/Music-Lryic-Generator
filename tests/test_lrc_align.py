@@ -311,22 +311,31 @@ class RetimeTests(unittest.TestCase):
         self.assertEqual(la.retimed_line_start(9.0, 10.0, 14.0), 10.0 - la.MAX_EARLY_SHIFT)
         self.assertEqual(la.retimed_line_start(13.0, 10.0, 14.0), 10.0 + la.MAX_LATE_SHIFT)
         self.assertEqual(la.retimed_line_start(None, 10.0, 14.0), 10.0)
+        # Small differences are left alone: the original tag is probably right.
+        self.assertEqual(la.retimed_line_start(10.1, 10.0, 14.0), 10.0)
+        self.assertEqual(la.retimed_line_start(9.9, 10.0, 14.0), 10.0)
         # Never reaches the next line even when the aligner says so.
         self.assertAlmostEqual(la.retimed_line_start(10.9, 10.0, 10.5), 10.5 - la.MAX_EARLY_SHIFT - la.MIN_WORD_STEP)
 
     def test_tag_moves_to_sung_first_word(self):
-        out, stats = self.convert(0.3)
+        # The aligner hears first words FIRST_WORD_BIAS late; that is corrected.
+        out, stats = self.convert(0.3 + la.FIRST_WORD_BIAS)
         # The first line has no previous line as context, so its tag is kept.
-        self.assertTrue(out[0].startswith("[00:10.00]<00:10.00>one <00:10.80>two"), out[0])
-        self.assertTrue(out[1].startswith("[00:14.30]<00:14.30>four <00:14.80>five"), out[1])
+        self.assertTrue(out[0].startswith("[00:10.00]<00:10.00>one <00:10.92>two"), out[0])
+        self.assertTrue(out[1].startswith("[00:14.30]<00:14.30>four <00:14.92>five"), out[1])
         self.assertTrue(out[2].startswith("[00:17.30]<00:17.30>six"), out[2])
         self.assertEqual(stats.lines_retimed, 2)
         self.assertEqual(stats.lines_aligned, 3)
 
+    def test_accurate_tags_are_left_alone(self):
+        out, stats = self.convert(0.1 + la.FIRST_WORD_BIAS)
+        self.assertTrue(out[1].startswith("[00:14.00]<00:14.00>four"), out[1])
+        self.assertEqual(stats.lines_retimed, 0)
+
     def test_tag_moves_earlier_within_bound(self):
-        out, _ = self.convert(-0.2)
+        out, _ = self.convert(-0.2 + la.FIRST_WORD_BIAS)
         self.assertTrue(out[1].startswith("[00:13.80]<00:13.80>four"), out[1])
-        out, _ = self.convert(-0.45)
+        out, _ = self.convert(-0.45 + la.FIRST_WORD_BIAS)
         self.assertTrue(out[1].startswith("[00:13.70]<00:13.70>four"), out[1])
 
     def test_late_shift_is_capped(self):
@@ -334,7 +343,7 @@ class RetimeTests(unittest.TestCase):
         self.assertTrue(out[1].startswith("[00:14.50]<00:14.50>four"), out[1])
 
     def test_keep_line_times(self):
-        out, stats = self.convert(0.3, retime_lines=False)
+        out, stats = self.convert(0.3 + la.FIRST_WORD_BIAS, retime_lines=False)
         self.assertTrue(out[1].startswith("[00:14.00]<00:14.00>four"), out[1])
         self.assertEqual(stats.lines_retimed, 0)
 
@@ -346,7 +355,8 @@ class RetimeTests(unittest.TestCase):
     def test_words_never_pass_the_next_retimed_tag(self):
         # Line 1's words run late; line 2's tag moves 0.3s later. Every word of
         # line 1 must still sit before line 2's new tag.
-        when = {"one": 10.0, "two": 13.9, "three": 14.4, "four": 14.3, "five": 14.8, "six": 17.0, "seven": 17.4}
+        when = {"one": 10.0, "two": 13.9, "three": 14.4, "four": 14.3 + la.FIRST_WORD_BIAS, "five": 14.8,
+                "six": 17.0, "seven": 17.4}
 
         def fn(start, end, text):
             return [(w, when[w], when[w] + 0.2, .9) for w in text.split()]

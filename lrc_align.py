@@ -60,6 +60,11 @@ SOLO_TAIL_MAX = 15.0
 # little late, so the bounds are deliberately tight.
 MAX_EARLY_SHIFT = 0.3
 MAX_LATE_SHIFT = 0.5
+# Measured against a professionally timed file, the aligner hears the first
+# word of a line this much later than it really starts.
+FIRST_WORD_BIAS = 0.12
+# Tags already this close to the sung first word are left exactly as they are.
+RETIME_DEADBAND = 0.15
 # Audio included after the next line's timestamp so ad-libs that overlap the
 # next line can still be placed where they are sung.
 TAIL_PAD = 0.5
@@ -388,6 +393,8 @@ def retimed_line_start(first_word: Optional[float], tag_start: float, next_start
     """
     if first_word is None:
         return tag_start
+    if abs(first_word - tag_start) < RETIME_DEADBAND:
+        return tag_start
     new_start = min(max(first_word, tag_start - MAX_EARLY_SHIFT), tag_start + MAX_LATE_SHIFT)
     if next_start is not None:
         new_start = min(new_start, next_start - MAX_EARLY_SHIFT - MIN_WORD_STEP)
@@ -522,8 +529,8 @@ def convert_lines(
         tokens_by_idx[idx] = tokens
         # Only trust the first word's time when a previous line was aligned in
         # front of it: the first word of a slice is always pulled to the slice start.
-        if retime_lines and ctx.has_prev and times and not alignment_is_poor(times):
-            new_start = retimed_line_start(times[0], start, next_line_start(lines, start))
+        if retime_lines and ctx.has_prev and times and times[0] is not None and not alignment_is_poor(times):
+            new_start = retimed_line_start(times[0] - FIRST_WORD_BIAS, start, next_line_start(lines, start))
             if abs(new_start - start) >= 0.005:
                 stats.lines_retimed += 1
             eff_start[idx] = new_start

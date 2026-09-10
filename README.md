@@ -108,10 +108,15 @@ matching audio are skipped and listed in the log.
 - Line timestamps in lyric files are often a few tenths of a second early, so
   the player flips to the next line while the last word is still being sung.
   By default the tool moves each line's timestamp to where its first word is
-  actually sung, at most 0.3 s earlier or 0.5 s later than the original. Every
-  word of a line is kept before the next line's timestamp so nothing gets
-  skipped. Untick the option in the GUI or pass `--keep-line-times` to leave
-  line timestamps exactly as they were.
+  actually sung, at most 0.3 s earlier or 0.5 s later than the original.
+  Timestamps that are already within 0.15 s of the vocal are left untouched,
+  so accurately timed files stay as they are. Every word of a line is kept
+  before the next line's timestamp so nothing gets skipped. Untick the option
+  in the GUI or pass `--keep-line-times` to leave line timestamps exactly as
+  they were.
+- Measured against a professionally timed word-by-word file, word timings
+  land within 0.2 s for about 80% of words and within 0.5 s for 99%, using
+  the `base` model.
 - Speed: on a CPU the `base` model takes roughly a minute for a five minute
   song with dense lyrics. A GPU is many times faster.
 
