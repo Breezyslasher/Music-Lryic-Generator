@@ -118,6 +118,17 @@ matching audio are skipped and listed in the log.
   off by the same amount, common with lyrics from a service and audio from
   elsewhere), the whole file is shifted by that amount and the file is
   flagged in the report.
+- Every converted file starts with a provenance tag, the standard LRC id tag
+  for the program that wrote the file:
+
+      [re:lrc-align 1.0.0 align word]
+
+  Players ignore it; tools like Beetdrop read it as writer, version, timing
+  source and timing level. Any `[re:...]` tag already in the input is
+  replaced, since it would otherwise claim the file is still line-level.
+  Where the old tag named where the words came from, that is kept as a fifth
+  field (`from-apple`). Skipped files are never touched, so re-running the
+  tool changes nothing.
 - A report named `lrc_conversion_report.txt` is written to the output folder
   after each run. It lists the files worth checking by hand first: files
   that were shifted, lines that could not be aligned, lyric files with no
