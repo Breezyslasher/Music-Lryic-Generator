@@ -93,6 +93,7 @@ The first run downloads the Whisper model.
 | `--device cpu|cuda` | force a device (default: auto) |
 | `-r`, `--recursive` | include sub-folders; the folder structure is mirrored in the output |
 | `--reconvert` | also redo files this tool converted before (recognised by their `[re:lrc-align ...]` tag), from the `.lrc.bak` original; word-by-word files from any other source are still left alone. Use after updating the tool. |
+| `--syllables` | also tag syllables inside words, Apple style (`Tum<00:10.18>ble`). Each word's syllables are spread evenly across the time the aligner heard for that word, so this is a guess within the word rather than a measurement; the visible effect is on long-held words. Needs `pyphen` (in `requirements.txt`). |
 | `--only-flagged [REPORT]` | process only the files listed as flagged in a report from an earlier run (default: the report in the output folder), redoing them from their `.lrc.bak`. Typical use: a second pass over flagged songs with `--model medium.en`. |
 
 ### After a run

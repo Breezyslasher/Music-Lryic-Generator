@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.3"
+__version__ = "1.3.0"
 
 # Name written into the ``[re:...]`` provenance tag of every converted file.
 WRITER = "lrc-align"
@@ -96,6 +96,16 @@ CROWDED_GAP = 0.05
 # When at least this share of a file's lines could not be aligned, most of
 # its word timing would be invented: the file is not written at all.
 UNALIGNED_SKIP_FRACTION = 0.5
+# Syllable tags (Apple style, ``Tum<00:10.18>ble``) are only written when each
+# syllable gets at least this much time; shorter words stay one tag.
+MIN_SYLLABLE_GAP = 0.05
+# Hyphenation dictionaries by whisper language code.
+SYLLABLE_DICTS = {
+    "en": "en_US", "es": "es", "fr": "fr", "de": "de_DE", "it": "it_IT", "pt": "pt_PT",
+    "nl": "nl_NL", "sv": "sv", "ru": "ru_RU", "pl": "pl_PL", "cs": "cs_CZ", "da": "da_DK",
+    "nb": "nb_NO", "hu": "hu_HU", "fi": "fi_FI", "el": "el_GR", "tr": "tr_TR",
+}
+SyllableSplitter = Callable[[str], List[str]]
 
 
 def line_span_cap(n_words: int) -> float:
@@ -356,6 +366,27 @@ def map_aligned_words_to_tokens(
     return times
 
 
+def aligned_end_of_last_token(tokens: Sequence[str], aligned: Sequence[Tuple[str, float, float, float]]
+                              ) -> Optional[float]:
+    """The aligner's end time for the word covering the last token, if usable."""
+    aligned = [(w, s, e, p) for (w, s, e, p) in aligned if _squash(w)]
+    if not aligned or not tokens:
+        return None
+    token_total = sum(len(_squash(t)) for t in tokens)
+    word_total = sum(len(_squash(w)) for w, _, _, _ in aligned)
+    if token_total == 0 or word_total == 0:
+        return None
+    last_offset = token_total - len(_squash(tokens[-1]))
+    target = int(last_offset * word_total / token_total + 0.5)
+    pos = 0
+    for word, start, end, prob in aligned:
+        if pos + len(_squash(word)) > target:
+            return None if ((end - start) <= 0 and prob <= 0) else end
+        pos += len(_squash(word))
+    word, start, end, prob = aligned[-1]
+    return None if ((end - start) <= 0 and prob <= 0) else end
+
+
 def alignment_is_poor(times: Sequence[Optional[float]]) -> bool:
     """True when fewer than half the words got a usable time from the aligner."""
     n = len(times)
@@ -547,8 +578,79 @@ def fit_before(times: Sequence[float], limit: float, step: float) -> List[float]
     return out
 
 
-def build_word_line(tag: str, tokens: Sequence[str], times: Sequence[float], decimals: int = 2) -> str:
-    parts = [f"<{format_timestamp(t, decimals)}>{tok}" for tok, t in zip(tokens, times)]
+def make_syllable_splitter(language: str) -> Optional[SyllableSplitter]:
+    """A function that splits a token into syllables, or None when the
+    language has no hyphenation dictionary (words then stay whole)."""
+    code = SYLLABLE_DICTS.get((language or "en").split("-")[0].lower())
+    if code is None:
+        return None
+    try:
+        import pyphen  # type: ignore
+    except ImportError as e:  # pragma: no cover - depends on the environment
+        raise RuntimeError("Syllable splitting needs the 'pyphen' package: pip install pyphen") from e
+    dic = pyphen.Pyphen(lang=code)
+    core = re.compile(r"^([^A-Za-z\u00C0-\u024F\u0400-\u04FF]*)(.*?)([^A-Za-z\u00C0-\u024F\u0400-\u04FF]*)$")
+
+    def split(token: str) -> List[str]:
+        m = core.match(token)
+        if not m or not m.group(2):
+            return [token]
+        lead, word, trail = m.groups()
+        cuts = [c for c in dic.positions(word) if 0 < c < len(word)]
+        if not cuts:
+            return [token]
+        pieces = [word[a:b] for a, b in zip([0] + cuts, cuts + [len(word)])]
+        pieces[0] = lead + pieces[0]
+        pieces[-1] = pieces[-1] + trail
+        return pieces
+    return split
+
+
+def syllable_times(start: float, end: float, n: int) -> List[float]:
+    """Spread ``n`` syllables evenly across a word's span."""
+    span = max(0.0, end - start)
+    return [start + span * k / n for k in range(n)]
+
+
+def word_end_times(starts: Sequence[float], last_end: Optional[float], limit: float) -> List[float]:
+    """Each word ends where the next begins; the last word ends where the
+    aligner heard it end, bounded by the line's window."""
+    if not starts:
+        return []
+    ends = list(starts[1:])
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    typical = sorted(gaps)[len(gaps) // 2] if gaps else 0.3
+    last = starts[-1] + typical if last_end is None else last_end
+    last = min(max(last, starts[-1] + MIN_SYLLABLE_GAP), max(limit, starts[-1] + MIN_SYLLABLE_GAP))
+    ends.append(last)
+    return ends
+
+
+def build_word_line(tag: str, tokens: Sequence[str], times: Sequence[float], decimals: int = 2,
+                    ends: Optional[Sequence[float]] = None,
+                    splitter: Optional[SyllableSplitter] = None) -> str:
+    """Format a line.  With ``splitter`` and ``ends`` each word's syllables get
+    their own tag inside the word, Apple style: ``Tum<00:10.18>ble``."""
+    if splitter is None or ends is None:
+        parts = [f"<{format_timestamp(t, decimals)}>{tok}" for tok, t in zip(tokens, times)]
+        return f"{tag}{' '.join(parts)}"
+    step = min_printed_step(decimals)
+    parts: List[str] = []
+    prev = None
+    for tok, t, e in zip(tokens, times, ends):
+        pieces = splitter(tok)
+        n = len(pieces)
+        if n > 1 and (e - t) / n >= MIN_SYLLABLE_GAP:
+            stamps = syllable_times(t, e, n)
+        else:
+            pieces, stamps = [tok], [t]
+        text = ""
+        for piece, st in zip(pieces, stamps):
+            if prev is not None and st < prev + step:
+                st = prev + step
+            text += f"<{format_timestamp(st, decimals)}>{piece}"
+            prev = st
+        parts.append(text)
     return f"{tag}{' '.join(parts)}"
 
 
@@ -803,12 +905,14 @@ def convert_lines(
     should_stop: Optional[Callable[[], bool]] = None,
     retime_lines: bool = True,
     _allow_global_shift: bool = True,
+    splitter: Optional[SyllableSplitter] = None,
 ) -> Tuple[List[str], ConvertStats]:
     stats = ConvertStats(lines_total=len(lines))
     windows = line_windows(lines, audio_duration)
 
     # Pass 1: align every line and decide where its tag should sit.
     raw_times: Dict[int, List[Optional[float]]] = {}
+    last_ends: Dict[int, Optional[float]] = {}
     tokens_by_idx: Dict[int, List[str]] = {}
     first_words: Dict[int, float] = {}
     eff_start: Dict[int, float] = {idx: ln.start for idx, ln in enumerate(lines) if ln.start is not None}
@@ -825,6 +929,7 @@ def convert_lines(
         all_times = map_aligned_words_to_tokens(ctx.tokens, aligned)
         times = all_times[ctx.first_token:ctx.first_token + len(tokens)]
         raw_times[idx] = times
+        last_ends[idx] = aligned_end_of_last_token(ctx.tokens[:ctx.first_token + len(tokens)], aligned)
         tokens_by_idx[idx] = tokens
         probs = [float(p) for (_, _, _, p) in aligned if p is not None]
         if probs:
@@ -842,7 +947,7 @@ def convert_lines(
             # audio slices are taken from the right places.
             shifted = [shift_line(ln, amount, decimals) for ln in lines]
             output, stats2 = convert_lines(shifted, align_fn, audio_duration, decimals, should_stop,
-                                           retime_lines=True, _allow_global_shift=False)
+                                           retime_lines=True, _allow_global_shift=False, splitter=splitter)
             stats2.global_offset = amount
             return output, stats2
         if mode in ("global", "per_line"):
@@ -891,7 +996,10 @@ def convert_lines(
         if line_is_crowded(final_times, step):
             stats.lines_forced += 1
         tag = line.tag if abs(start - line.start) < 0.005 else f"[{format_timestamp(start, decimals)}]"
-        output.append(build_word_line(tag, tokens_by_idx[idx], final_times, decimals))
+        ends = None
+        if splitter is not None and not used_fallback:
+            ends = word_end_times(final_times, last_ends.get(idx), end - step)
+        output.append(build_word_line(tag, tokens_by_idx[idx], final_times, decimals, ends, splitter))
     return output, stats
 
 
@@ -1317,6 +1425,7 @@ def convert_file(
     should_stop: Optional[Callable[[], bool]] = None,
     retime_lines: bool = True,
     content: Optional[str] = None,
+    syllables: bool = False,
 ) -> FileResult:
     if content is None:
         content = read_text(lrc_path)
@@ -1335,9 +1444,11 @@ def convert_file(
         first = min((ln.start for ln in lines if ln.needs_alignment), default=0.0)
         lang = aligner.detect_language(first)
 
+    splitter = make_syllable_splitter(lang) if syllables else None
     new_lines, stats = convert_lines(
         lines, aligner.make_align_fn(lang), audio_duration=duration,
         decimals=detect_decimals(lines), should_stop=should_stop, retime_lines=retime_lines,
+        splitter=splitter,
     )
 
     stats.source_out_of_order = out_of_order
@@ -1373,6 +1484,7 @@ def process_library(
     retime_lines: bool = True,
     reconvert: bool = False,
     only: Optional[Iterable[str]] = None,
+    syllables: bool = False,
 ) -> Summary:
     """Convert every line-level .lrc under ``lyrics_dir``.
 
@@ -1437,7 +1549,7 @@ def process_library(
                 else:
                     log(f"[{i}/{total}] {'Re-converting' if redo else 'Aligning'}: {lrc.name}  <-  {audio.name}")
                     result = convert_file(lrc, audio, aligner, out_path, language, should_stop, retime_lines,
-                                          content=content)
+                                          content=content, syllables=syllables)
                     s = result.stats
                     if result.status == "skipped_unaligned":
                         log(f"    NOT written: {result.message} - do the lyrics match this recording?")

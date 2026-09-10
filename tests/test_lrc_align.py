@@ -814,6 +814,74 @@ class RoundTwoTests(unittest.TestCase):
         self.assertEqual(stats.lines_forced, 0)
 
 
+def stub_splitter(token):
+    """Syllables marked with '|' in the fixture text, e.g. 'Tum|ble'."""
+    return token.split("|") if "|" in token else [token]
+
+
+class SyllableTests(unittest.TestCase):
+    def test_syllables_spread_across_the_word(self):
+        line = la.build_word_line("[00:09.93]", ["Tum|ble", "out", "of", "bed,"],
+                                  [9.93, 10.32, 10.50, 10.64], 2, ends=[10.32, 10.50, 10.64, 10.92],
+                                  splitter=stub_splitter)
+        self.assertEqual(line, "[00:09.93]<00:09.93>Tum<00:10.12>ble <00:10.32>out <00:10.50>of <00:10.64>bed,")
+
+    def test_short_words_are_not_split(self):
+        # 0.06 s for two syllables is under the minimum per syllable: one tag.
+        line = la.build_word_line("[00:10.00]", ["Tum|ble", "out"], [10.0, 10.06], 2, ends=[10.06, 10.5],
+                                  splitter=stub_splitter)
+        self.assertEqual(line, "[00:10.00]<00:10.00>Tum|ble <00:10.06>out")
+
+    def test_syllable_tags_stay_distinct(self):
+        line = la.build_word_line("[00:10.00]", ["a|b|c|d", "e"], [10.0, 10.2], 2, ends=[10.2, 10.5],
+                                  splitter=stub_splitter)
+        tags = [m.group(0) for m in la.WORD_TS_RE.finditer(line)]
+        self.assertEqual(len(tags), len(set(tags)), line)
+        vals = [la.parse_timestamp(*m.groups()) for m in la.WORD_TS_RE.finditer(line)]
+        self.assertTrue(all(b > a for a, b in zip(vals, vals[1:])), line)
+
+    def test_word_end_times(self):
+        self.assertEqual(la.word_end_times([10.0, 10.5, 11.0], 11.4, 20.0), [10.5, 11.0, 11.4])
+        # no aligner end for the last word: a typical gap is used
+        self.assertEqual(la.word_end_times([10.0, 10.5, 11.0], None, 20.0), [10.5, 11.0, 11.5])
+        # never past the window, never shorter than one syllable's worth
+        self.assertEqual(la.word_end_times([10.0, 10.5], 15.0, 10.8), [10.5, 10.8])
+        self.assertAlmostEqual(la.word_end_times([10.0, 10.5], 10.51, 20.0)[-1], 10.5 + la.MIN_SYLLABLE_GAP)
+
+    def test_convert_lines_with_syllables(self):
+        lines = la.parse_lrc("[00:10.00] Tum|ble out of bed,\n[00:12.39] Pour my|self a cup\n")
+        out, stats = la.convert_lines(lines, context_align(lines), splitter=stub_splitter)
+        self.assertTrue(out[0].startswith("[00:10.00]<00:10.00>Tum<00:10.25>ble <00:10.50>out"), out[0])
+        self.assertIn("<00:12.89>my<00:13.14>self", out[1])
+        # without a splitter the same input is plain word tags (and the default)
+        plain, _ = la.convert_lines(lines, context_align(lines))
+        self.assertIn("<00:10.00>Tum|ble <00:10.50>out", plain[0])
+        # syllable output still counts as word-level and is skipped on re-run
+        self.assertTrue(la.is_word_level(la.parse_lrc("\n".join(out))))
+        # and strips back to whole words for --reconvert
+        # (the stub's "|" marker is consumed by the split, so the whole word comes back)
+        self.assertEqual(la.line_level_source("\n".join(out) + "\n").splitlines()[0], "[00:10.00] Tumble out of bed,")
+
+    def test_fallback_lines_are_not_split(self):
+        lines = la.parse_lrc("[00:10.00] Tum|ble out\n[00:12.00] next\n")
+        out, _ = la.convert_lines(lines, lambda s, e, t: [], splitter=stub_splitter)
+        self.assertNotIn("Tum<", out[0])
+
+    def test_real_splitter_if_available(self):
+        try:
+            import pyphen  # noqa: F401
+        except ImportError:
+            self.skipTest("pyphen not installed")
+        split = la.make_syllable_splitter("en")
+        self.assertEqual(split("Tumble"), ["Tum", "ble"])
+        self.assertEqual(split("ambition"), ["am", "bi", "tion"])
+        self.assertEqual(split("bed,"), ["bed,"])
+        self.assertEqual(split("(perfection)"), ["(per", "fec", "tion)"])
+        self.assertEqual(split("5-4-3-2"), ["5-4-3-2"])
+        self.assertEqual(split("a"), ["a"])
+        self.assertIsNone(la.make_syllable_splitter("ja"))       # no dictionary: words stay whole
+
+
 class FileMatchingTests(unittest.TestCase):
     def test_normalize_stem(self):
         self.assertEqual(la.normalize_stem("Gangsta#U2019s Paradise"), "gangsta’s paradise")

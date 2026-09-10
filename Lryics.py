@@ -58,6 +58,7 @@ def run_cli(args: argparse.Namespace) -> int:
         audio_dir, lyrics_dir, output_dir, aligner,
         language=args.language, recursive=args.recursive, log=print,
         retime_lines=not args.keep_line_times, reconvert=reconvert, only=only,
+        syllables=args.syllables,
     )
     print("Done: " + summary.describe())
     return 0 if summary.count("failed") == 0 else 1
@@ -79,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--only-flagged", metavar="REPORT", nargs="?", const="",
                    help="Only process the files listed as flagged in a report from an earlier run "
                         "(default: the report in the output folder). Implies --reconvert.")
+    p.add_argument("--syllables", action="store_true",
+                   help="Also tag syllables inside words, Apple style (Tum<00:10.18>ble); needs 'pip install pyphen'")
     p.add_argument("--keep-line-times", action="store_true",
                    help="Keep the original line timestamps instead of moving them to the sung first word")
     return p
@@ -106,6 +109,7 @@ def run_gui() -> None:
             self.retime_var = tk.BooleanVar(value=True)
             self.reconvert_var = tk.BooleanVar(value=False)
             self.only_flagged_var = tk.BooleanVar(value=False)
+            self.syllables_var = tk.BooleanVar(value=False)
             self.report_path = tk.StringVar()
             self.status_text = tk.StringVar(
                 value="Pick the folder with your songs. Lyrics/output default to the same folder.")
@@ -143,6 +147,8 @@ def run_gui() -> None:
             ttk.Checkbutton(opts, text="Include sub-folders", variable=self.recursive_var).pack(side=tk.LEFT)
             ttk.Checkbutton(frm, text="Move line timestamps to where the first word is sung (recommended)",
                             variable=self.retime_var).pack(anchor=tk.W, pady=(0, 4))
+            ttk.Checkbutton(frm, text="Split words into syllables, Apple style (Tum<00:10.18>ble); needs pip install pyphen",
+                            variable=self.syllables_var).pack(anchor=tk.W, pady=(0, 4))
             ttk.Checkbutton(frm, text="Re-do files this tool converted before (uses the .lrc.bak originals)",
                             variable=self.reconvert_var).pack(anchor=tk.W, pady=(0, 4))
             flagged = ttk.Frame(frm)
@@ -295,6 +301,7 @@ def run_gui() -> None:
                     retime_lines=self.retime_var.get(),
                     reconvert=self.reconvert_var.get() or only is not None,
                     only=only,
+                    syllables=self.syllables_var.get(),
                 )
                 self.log("Done: " + summary.describe())
                 self.set_status("Finished: " + summary.describe())
