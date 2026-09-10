@@ -122,9 +122,16 @@ matching audio are skipped and listed in the log.
   after each run. It lists the files worth checking by hand first: files
   that were shifted, lines that could not be aligned, lyric files with no
   matching audio, and failures. Then it lists every file with what was done.
-- Measured against a professionally timed word-by-word file, word timings
-  land within 0.2 s for about 80% of words and within 0.5 s for 99%, using
-  the `base` model.
+- A line's words are never allowed to spread further than the song's own
+  pace justifies, so a held last note before an instrumental break cannot
+  drag words into the break. Slow ballads keep their long lines because the
+  limit scales with how slowly the song is sung.
+- Measured against professionally timed word-by-word files with the `base`
+  model: clean pop and country land within 0.5 s for 96 to 99% of words
+  (mean error 0.12 to 0.18 s), slow ballads 72 to 93% (mean 0.25 to 0.41 s),
+  and screamed hard rock about 60% (mean 0.47 s). Files in that last group
+  get a low-confidence flag in the report; the `small` or `medium` model
+  does noticeably better on them.
 - Speed: on a CPU the `base` model takes roughly a minute for a five minute
   song with dense lyrics. A GPU is many times faster.
 

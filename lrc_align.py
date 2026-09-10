@@ -50,7 +50,7 @@ LEAD_PAD = 0.15
 LEAD_PAD_SOLO = 0.5
 # Neighbouring lines are aligned together with a line as context when their
 # tags are this close; audio after the next line's tag included as context.
-CONTEXT_GAP = 8.0
+CONTEXT_GAP = 12.0
 CONTEXT_TAIL = 6.0
 # Audio after a line's tag when no next line is close enough to be context.
 SOLO_TAIL_MAX = 15.0
@@ -60,6 +60,15 @@ SOLO_TAIL_MAX = 15.0
 # allowance is for slow ballads.
 LINE_SPAN_BASE = 1.0
 LINE_SPAN_PER_WORD = 0.5
+# ...but slow ballads sing a word per second, so a line may also span up to
+# this many times the song's own typical seconds-per-word (median over lines).
+SPAN_PACE_FACTOR = 2.5
+# No single gap between two words of a line may exceed this many times the
+# song's pace (or the floor): a held note before an instrumental break tends to
+# drag the last word into the break.  Professional files show mid-line pauses
+# up to about 4x the song's pace, never more.
+GAP_PACE_FACTOR = 4.0
+GAP_FLOOR = 2.5
 # Mean aligner word confidence below which a file is flagged in the report
 # (loud or screamed vocals the model cannot follow well).
 LOW_CONFIDENCE = 0.5
@@ -69,11 +78,36 @@ def line_span_cap(n_words: int) -> float:
     return LINE_SPAN_BASE + LINE_SPAN_PER_WORD * max(1, n_words)
 
 
-def cap_line_span(times: List[float], n_words: Optional[int] = None) -> List[float]:
+def song_pace(raw_times: Iterable[Sequence[Optional[float]]]) -> Optional[float]:
+    """Median seconds per word across a song's aligned lines."""
+    paces = []
+    for times in raw_times:
+        known = [t for t in times if t is not None]
+        if len(known) >= 3 and not alignment_is_poor(times):
+            paces.append((known[-1] - known[0]) / (len(known) - 1))
+    if len(paces) < 3:      # too little to know the song's pace
+        return None
+    paces.sort()
+    n = len(paces)
+    return paces[n // 2] if n % 2 else (paces[n // 2 - 1] + paces[n // 2]) / 2
+
+
+def cap_line_span(times: List[float], n_words: Optional[int] = None, pace: Optional[float] = None) -> List[float]:
     """Compress a line's word times proportionally when they spread too far."""
     if len(times) < 2:
         return times
-    cap = line_span_cap(n_words or len(times))
+    n = n_words or len(times)
+    cap = line_span_cap(n)
+    if pace:
+        cap = max(cap, LINE_SPAN_BASE + SPAN_PACE_FACTOR * pace * (n - 1))
+    # Close single gaps that are far longer than the song ever pauses mid-line.
+    gap_cap = max(GAP_FLOOR, GAP_PACE_FACTOR * pace) if pace else GAP_FLOOR
+    times = list(times)
+    for k in range(1, len(times)):
+        excess = (times[k] - times[k - 1]) - gap_cap
+        if excess > 0:
+            for j in range(k, len(times)):
+                times[j] -= excess
     span = times[-1] - times[0]
     if span <= cap:
         return times
@@ -557,9 +591,9 @@ def build_context(lines: Sequence[LrcLine], idx: int, window_end: float,
                 e = min(e, lines[after_i].start)
             e = max(e, ns + TAIL_PAD)
         else:
-            # No next line close by: a single line never needs more than this.
-            solo_tail = min(SOLO_TAIL_MAX, line_span_cap(len(tokenize(line.text))) + 1.0)
-            e = min(window_end + TAIL_PAD, start + solo_tail)
+            # No next line close by: run up to the next tag (a slow ballad line
+            # can take ten seconds), but never more than SOLO_TAIL_MAX.
+            e = min(window_end + TAIL_PAD, start + SOLO_TAIL_MAX)
         return max(0.0, s), e
 
     s, e = slice_bounds(prev_i is not None, next_i is not None)
@@ -646,6 +680,7 @@ def convert_lines(
     # Pass 2: every word must sit between its own (possibly moved) tag and the
     # next line's tag, otherwise the player flips lines before showing it.
     ordered = sorted(eff_start.values())
+    pace = song_pace(raw_times.values())
     output: List[str] = []
     for idx, line in enumerate(lines):
         if idx not in windows:
@@ -665,7 +700,7 @@ def convert_lines(
             stats.lines_fallback += 1
         else:
             stats.lines_aligned += 1
-            final_times = cap_line_span(final_times)
+            final_times = cap_line_span(final_times, pace=pace)
         tag = line.tag if abs(start - line.start) < 0.005 else f"[{format_timestamp(start, decimals)}]"
         output.append(build_word_line(tag, tokens_by_idx[idx], final_times, decimals))
     return output, stats

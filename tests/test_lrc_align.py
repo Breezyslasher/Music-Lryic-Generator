@@ -276,7 +276,7 @@ class ContextTests(unittest.TestCase):
         ctx = la.build_context(self.THREE, 2, 17.0 + la.MAX_LINE_WINDOW, 20.0)
         self.assertEqual(ctx.text, "four five\nsix")
         self.assertEqual(ctx.first_token, 2)
-        self.assertAlmostEqual(ctx.slice_end, min(20.0, 17.0 + la.line_span_cap(1) + 1.0))
+        self.assertAlmostEqual(ctx.slice_end, 20.0)
         ctx = la.build_context(self.THREE, 2, 17.0 + la.MAX_LINE_WINDOW, 18.0)
         self.assertAlmostEqual(ctx.slice_end, 18.0)  # audio ends
 
@@ -285,7 +285,7 @@ class ContextTests(unittest.TestCase):
         ctx = la.build_context(lines, 1, 50.0, 200.0)
         self.assertEqual(ctx.text, "two")
         self.assertFalse(ctx.has_prev)
-        self.assertAlmostEqual(ctx.slice_end, 30.0 + la.line_span_cap(1) + 1.0)
+        self.assertAlmostEqual(ctx.slice_end, 30.0 + la.SOLO_TAIL_MAX)
 
     def test_lone_long_line_gets_more_audio(self):
         lines = la.parse_lrc("[00:10.00] " + " ".join(["w"] * 40) + "\n")
@@ -304,6 +304,33 @@ class SpanCapTests(unittest.TestCase):
         self.assertEqual(capped[0], 10.0)
         self.assertAlmostEqual(capped[-1] - capped[0], la.line_span_cap(4))
         self.assertTrue(capped[0] < capped[1] < capped[2] < capped[3])
+
+    def test_song_pace(self):
+        self.assertIsNone(la.song_pace([]))
+        self.assertIsNone(la.song_pace([[1.0, 2.0]]))          # too short to count
+        self.assertIsNone(la.song_pace([[0.0, 1.0, 2.0], [10.0, 10.5, 11.0, 11.5]]))  # fewer than 3 lines
+        self.assertAlmostEqual(
+            la.song_pace([[0.0, 1.0, 2.0], [10.0, 10.5, 11.0, 11.5], [20.0, 20.8, 21.6], [None, None, 5.0]]),
+            0.8)  # median of 1.0, 0.5, 0.8; the poor line is ignored
+
+    def test_ballad_pace_loosens_cap(self):
+        # A ballad singing a word per second keeps its long line...
+        times = [10.0 + k for k in range(10)]
+        self.assertEqual(la.cap_line_span(times, pace=0.95), times)
+        # ...while the same spread in a fast song is compressed.
+        capped = la.cap_line_span(times, pace=0.3)
+        self.assertLess(capped[-1] - capped[0], 8.0)
+        self.assertEqual(capped[0], 10.0)
+
+    def test_huge_single_gap_is_closed(self):
+        # "...and hooooow" dragged into the instrumental break after it.
+        times = [10.0, 10.4, 10.8, 11.2, 19.0]
+        capped = la.cap_line_span(times, pace=0.5)
+        self.assertEqual(capped[:4], times[:4])
+        self.assertAlmostEqual(capped[4], 11.2 + max(la.GAP_FLOOR, la.GAP_PACE_FACTOR * 0.5))
+        # A ballad's real 3.5 s mid-line pause survives.
+        times = [10.0, 11.0, 14.5, 15.5]
+        self.assertEqual(la.cap_line_span(times, pace=0.9), times)
 
     def test_convert_applies_cap(self):
         lines = la.parse_lrc("[00:10.00] had a bad day\n")
