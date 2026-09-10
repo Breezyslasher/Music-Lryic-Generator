@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Name written into the ``[re:...]`` provenance tag of every converted file.
 WRITER = "lrc-align"
@@ -142,6 +142,14 @@ RETIME_GATE = 0.15
 GLOBAL_OFFSET_MAX_SPREAD = 0.3     # interquartile range of per-line shifts
 GLOBAL_OFFSET_MIN_LINES = 6
 MAX_GLOBAL_OFFSET = 10.0
+# Room for the previous line's tail.  When a line's last aligned word lands at
+# or after the next line's tag while the next line's own first word is heard
+# later still, that tag is early and the last word would be shown for an
+# instant before the player flips lines.  Move the tag to just after the tail,
+# never past the next line's first word and never more than this.
+TAIL_ROOM = 0.15
+TAIL_ROOM_TRIGGER = 0.05
+MAX_TAIL_SHIFT = 0.6
 # Audio included after the next line's timestamp so ad-libs that overlap the
 # next line can still be placed where they are sung.
 TAIL_PAD = 0.5
@@ -511,6 +519,38 @@ def next_line_start(lines: Sequence[LrcLine], start: float) -> Optional[float]:
     return min(later) if later else None
 
 
+def make_room_for_tails(lines: Sequence[LrcLine], raw_times: Dict[int, List[Optional[float]]],
+                        eff_start: Dict[int, float]) -> int:
+    """Push an early tag later when the previous line's last word needs the room.
+
+    Uses two lines' evidence at once: line A's aligned last word and line B's
+    aligned first word.  Returns how many tags moved.  ``eff_start`` is updated
+    in place.
+    """
+    moved = 0
+    order = sorted(raw_times, key=lambda i: lines[i].start)
+    for a, b in zip(order, order[1:]):
+        ra, rb = raw_times[a], raw_times[b]
+        if alignment_is_poor(ra) or alignment_is_poor(rb):
+            continue
+        last_a = next((t for t in reversed(ra) if t is not None), None)
+        first_b = next((t for t in rb if t is not None), None)
+        if last_a is None or first_b is None:
+            continue
+        tag_b = eff_start[b]
+        first_b -= FIRST_WORD_BIAS
+        if last_a < tag_b - TAIL_ROOM_TRIGGER or first_b <= last_a + TAIL_ROOM:
+            continue
+        new = min(last_a + TAIL_ROOM, first_b, float(lines[b].start) + MAX_TAIL_SHIFT)
+        after = next_line_start(lines, float(lines[b].start))
+        if after is not None:
+            new = min(new, after - MIN_WORD_STEP * 2)
+        if new > tag_b + 0.005:
+            eff_start[b] = new
+            moved += 1
+    return moved
+
+
 def retimed_line_start(first_word: Optional[float], tag_start: float, next_start: Optional[float]) -> float:
     """Move a line tag to where its first word is sung, within safe bounds.
 
@@ -684,6 +724,7 @@ def convert_lines(
                 if abs(new_start - start) >= 0.005:
                     stats.lines_retimed += 1
                 eff_start[idx] = new_start
+        stats.lines_retimed += make_room_for_tails(lines, raw_times, eff_start)
 
     # Pass 2: every word must sit between its own (possibly moved) tag and the
     # next line's tag, otherwise the player flips lines before showing it.
@@ -991,6 +1032,31 @@ def output_path_for(lrc: Path, lyrics_dir: Path, output_dir: Path, recursive: bo
     return output_dir / lrc.name
 
 
+def written_by_this_tool(lines: Sequence[LrcLine]) -> bool:
+    """True when the file's first ``[re:...]`` tag names this tool as the writer."""
+    for ln in lines:
+        m = PROVENANCE_RE.match(ln.raw)
+        if m:
+            payload = m.group(1).split()
+            return bool(payload) and payload[0] == WRITER
+    return False
+
+
+def line_level_source(content: str) -> str:
+    """Turn one of this tool's word-by-word files back into line-by-line text."""
+    out = []
+    for line in content.splitlines():
+        if PROVENANCE_RE.match(line):
+            continue
+        m = LINE_TS_RE.match(line.strip())
+        if m and WORD_TS_RE.search(line):
+            text = WORD_TS_RE.sub("", line.strip()[m.end():]).strip()
+            out.append(f"{m.group(0)} {text}")
+        else:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
 def stamp_provenance(out_lines: Sequence[str]) -> List[str]:
     """Put this tool's ``[re:...]`` tag at the top of a converted file.
 
@@ -1017,6 +1083,20 @@ def stamp_provenance(out_lines: Sequence[str]) -> List[str]:
     return [f"[re:{' '.join(fields)}]"] + kept
 
 
+def backup_file(src: Path, dst: Path) -> None:
+    """Copy ``src`` to ``dst``, contents only.
+
+    ``shutil.copy2`` also copies permissions and timestamps, which network
+    mounts such as gvfs SMB shares reject with "Operation not supported".
+    """
+    try:
+        shutil.copy2(src, dst)
+    except OSError:
+        if dst.exists():
+            dst.unlink()
+        shutil.copyfile(src, dst)
+
+
 def convert_file(
     lrc_path: Path,
     audio_path: Path,
@@ -1025,8 +1105,10 @@ def convert_file(
     language: str = "en",
     should_stop: Optional[Callable[[], bool]] = None,
     retime_lines: bool = True,
+    content: Optional[str] = None,
 ) -> FileResult:
-    content = read_text(lrc_path)
+    if content is None:
+        content = read_text(lrc_path)
     lines = parse_lrc(content)
     if not any(ln.is_lyric for ln in lines):
         return FileResult(lrc_path, "skipped_no_lyrics", message="no timed lyric lines")
@@ -1050,7 +1132,7 @@ def convert_file(
     if output_path.resolve() == lrc_path.resolve():
         backup = lrc_path.with_suffix(lrc_path.suffix + ".bak")
         if not backup.exists():
-            shutil.copy2(lrc_path, backup)
+            backup_file(lrc_path, backup)
     newline = "\r\n" if "\r\n" in content else "\n"
     output_path.write_text(newline.join(new_lines) + newline, encoding="utf-8")
     return FileResult(lrc_path, "converted", output=output_path, audio=audio_path, stats=stats,
@@ -1068,7 +1150,15 @@ def process_library(
     progress: Optional[Callable[[int, int], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     retime_lines: bool = True,
+    reconvert: bool = False,
 ) -> Summary:
+    """Convert every line-level .lrc under ``lyrics_dir``.
+
+    With ``reconvert`` the files this tool converted earlier (recognised by
+    their ``[re:lrc-align ...]`` tag) are done again from the ``.lrc.bak``
+    original where one exists, otherwise from the file with its word tags
+    stripped.  Word-by-word files written by anything else are never touched.
+    """
     summary = Summary()
     lrc_files = find_lrc_files(lyrics_dir, recursive)
     if not lrc_files:
@@ -1086,7 +1176,7 @@ def process_library(
         try:
             if out_path.resolve() != lrc.resolve() and out_path.exists():
                 existing = parse_lrc(read_text(out_path))
-                if is_word_level(existing):
+                if is_word_level(existing) and not (reconvert and written_by_this_tool(existing)):
                     result = FileResult(lrc, "skipped_word_level", output=out_path,
                                         message="output already word-by-word")
                     summary.results.append(result)
@@ -1095,7 +1185,14 @@ def process_library(
                         progress(i, total)
                     continue
 
-            lines = parse_lrc(read_text(lrc))
+            content = read_text(lrc)
+            lines = parse_lrc(content)
+            redo = False
+            if reconvert and is_word_level(lines) and written_by_this_tool(lines):
+                backup = lrc.with_suffix(lrc.suffix + ".bak")
+                content = read_text(backup) if backup.exists() else line_level_source(content)
+                lines = parse_lrc(content)
+                redo = True
             if not any(ln.is_lyric for ln in lines):
                 result = FileResult(lrc, "skipped_no_lyrics")
                 log(f"[{i}/{total}] Skip (no timed lyrics): {lrc.name}")
@@ -1108,8 +1205,9 @@ def process_library(
                     result = FileResult(lrc, "skipped_no_audio")
                     log(f"[{i}/{total}] Skip (no matching audio): {lrc.name}")
                 else:
-                    log(f"[{i}/{total}] Aligning: {lrc.name}  <-  {audio.name}")
-                    result = convert_file(lrc, audio, aligner, out_path, language, should_stop, retime_lines)
+                    log(f"[{i}/{total}] {'Re-converting' if redo else 'Aligning'}: {lrc.name}  <-  {audio.name}")
+                    result = convert_file(lrc, audio, aligner, out_path, language, should_stop, retime_lines,
+                                          content=content)
                     s = result.stats
                     if s:
                         extra = f", {s.lines_retimed} line time(s) adjusted" if s.lines_retimed else ""

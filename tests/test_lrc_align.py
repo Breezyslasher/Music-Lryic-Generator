@@ -465,6 +465,40 @@ class RetimeTests(unittest.TestCase):
         self.assertTrue(all(t < 14.3 for t in times), times)
         self.assertTrue(times[0] < times[1] < times[2], times)
 
+    def test_early_next_tag_makes_room_for_previous_tail(self):
+        # Line A's last word is sung at 14.02, line B is tagged 14.00 but its
+        # first word is heard at 14.40: B's tag moves to just after A's tail.
+        B = la.FIRST_WORD_BIAS
+        when = {"one": 10.0, "two": 12.0, "three": 14.02, "four": 14.40 + B, "five": 14.9,
+                "six": 17.0 + B, "seven": 17.4}
+
+        def fn(start, end, text):
+            return [(w, when[w], when[w] + 0.2, .9) for w in text.split()]
+        out, stats = la.convert_lines(la.parse_lrc(self.TEXT), fn)
+        tag_b = la.parse_timestamp(*la.LINE_TS_RE.match(out[1]).groups())
+        self.assertGreaterEqual(tag_b, 14.17, out[1])
+        self.assertLessEqual(tag_b, 14.40, out[1])
+        times = [la.parse_timestamp(*m.groups()) for m in la.WORD_TS_RE.finditer(out[0])]
+        self.assertGreater(tag_b - times[-1], 0.1)       # last word now has room to show
+        self.assertGreaterEqual(stats.lines_retimed, 1)
+
+    def test_true_overlap_does_not_move_tag(self):
+        # Line B really starts before A's last word: nothing to gain by moving B.
+        when = {"one": 10.0, "two": 12.0, "three": 14.3, "four": 14.1, "five": 14.6,
+                "six": 17.0, "seven": 17.4}
+
+        def fn(start, end, text):
+            return [(w, when[w], when[w] + 0.2, .9) for w in text.split()]
+        out, _ = la.convert_lines(la.parse_lrc(self.TEXT), fn)
+        self.assertTrue(out[1].startswith("[00:14.00]"), out[1])
+
+    def test_tail_room_is_capped(self):
+        raw = {0: [10.0, 15.5], 1: [16.9, 17.2], 2: [30.0, 30.4]}
+        lines = la.parse_lrc("[00:10.00] a b\n[00:14.00] c d\n[00:30.00] e f\n")
+        eff = {0: 10.0, 1: 14.0, 2: 30.0}
+        self.assertEqual(la.make_room_for_tails(lines, raw, eff), 1)
+        self.assertAlmostEqual(eff[1], 14.0 + la.MAX_TAIL_SHIFT)
+
     def test_tags_stay_in_order_for_dense_lines(self):
         lines = la.parse_lrc("[00:10.00] a b\n[00:10.40] c d\n[00:10.80] e f\n")
         out, _ = la.convert_lines(lines, context_align(lines, 0.9))
@@ -637,6 +671,42 @@ class ProcessLibraryTests(unittest.TestCase):
             self.assertEqual(summary2.count("converted"), 0)
             self.assertEqual(summary2.count("skipped_word_level"), 2)
 
+    def test_reconvert_redoes_only_this_tools_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            music = Path(tmp)
+            for name in ("Mine", "MineNoBak", "Theirs", "Plain"):
+                (music / f"{name}.mp3").write_bytes(b"")
+            ours = "[re:lrc-align 0.9.0 align word]\n" + WORD_FILE
+            (music / "Mine.lrc").write_text(ours)
+            (music / "Mine.lrc.bak").write_text("[00:28.90] I got a feeling\n[00:36.66] That tonight's gonna be\n")
+            (music / "MineNoBak.lrc").write_text(ours)
+            (music / "Theirs.lrc").write_text("[re:beetdrop 0.62.0 apple word]\n" + WORD_FILE)
+            (music / "Plain.lrc").write_text(LINE_FILE)
+            theirs_before = (music / "Theirs.lrc").read_bytes()
+            summary = la.process_library(music, music, music, FakeAligner(), log=lambda m: None, reconvert=True)
+            self.assertEqual(summary.count("converted"), 3)
+            self.assertEqual(summary.count("skipped_word_level"), 1)
+            self.assertEqual((music / "Theirs.lrc").read_bytes(), theirs_before)
+            mine = (music / "Mine.lrc").read_text()
+            self.assertTrue(mine.startswith(f"[re:lrc-align {la.__version__} align word]"), mine[:50])
+            self.assertIn("[00:28.90]<00:28.90>I ", mine)                # re-aligned from the .bak
+            self.assertNotEqual(mine, ours)
+            # The original backup is kept, not overwritten with the word-level file.
+            self.assertEqual((music / "Mine.lrc.bak").read_text().splitlines()[0], "[00:28.90] I got a feeling")
+            nobak = (music / "MineNoBak.lrc").read_text()
+            self.assertIn("[00:28.90]<00:28.90>I ", nobak)               # re-aligned from stripped tags
+            self.assertNotEqual(nobak, ours)
+            self.assertEqual(len([l for l in nobak.splitlines() if l.startswith("[re:")]), 1)
+            # Without the flag nothing of ours is touched.
+            before = (music / "Mine.lrc").read_bytes()
+            summary = la.process_library(music, music, music, FakeAligner(), log=lambda m: None)
+            self.assertEqual(summary.count("converted"), 0)
+            self.assertEqual((music / "Mine.lrc").read_bytes(), before)
+
+    def test_line_level_source(self):
+        src = la.line_level_source("[re:lrc-align 1.0.0 align word]\n[ar:x]\n" + WORD_FILE + "[00:40.00]\n")
+        self.assertEqual(src, "[ar:x]\n[00:28.90] I got a feeling\n[00:36.66] That tonight's gonna be\n[00:40.00]\n")
+
     def test_flags(self):
         ok = la.FileResult(Path("a.lrc"), "converted", stats=la.ConvertStats(lines_aligned=10))
         self.assertEqual(ok.flags(), [])
@@ -667,6 +737,22 @@ class ProcessLibraryTests(unittest.TestCase):
             self.assertEqual(summary.count("converted"), 1)
             self.assertEqual((music / "Line.lrc.bak").read_text(), LINE_FILE)
             self.assertTrue(la.is_word_level(la.parse_lrc((music / "Line.lrc").read_text())))
+
+    def test_backup_survives_mount_without_metadata_support(self):
+        import shutil as _shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "a.lrc", Path(tmp) / "a.lrc.bak"
+            src.write_text("x")
+            real = _shutil.copy2
+
+            def refuse(*a, **k):
+                raise OSError(95, "Operation not supported")
+            _shutil.copy2 = refuse
+            try:
+                la.backup_file(src, dst)
+            finally:
+                _shutil.copy2 = real
+            self.assertEqual(dst.read_text(), "x")
 
     def test_stop_event(self):
         with tempfile.TemporaryDirectory() as tmp:
