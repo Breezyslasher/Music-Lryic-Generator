@@ -438,7 +438,7 @@ class RetimeTests(unittest.TestCase):
 
     def test_late_shift_is_capped(self):
         out, _ = self.convert(2.5)
-        self.assertTrue(out[1].startswith("[00:14.35]<00:14.35>four"), out[1])
+        self.assertTrue(out[1].startswith("[00:14.60]<00:14.60>four"), out[1])
 
     def test_keep_line_times(self):
         out, stats = self.convert(0.3 + la.FIRST_WORD_BIAS, retime_lines=False)

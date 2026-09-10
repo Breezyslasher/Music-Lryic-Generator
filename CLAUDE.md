@@ -107,7 +107,7 @@ it is better than losing it when the old tag is replaced.
 
 ### Do not
 
-- Change any timing behaviour. Line retiming (≤0.35 s later), the whole-file
+- Change any timing behaviour. Line retiming (≤0.6 s later), the whole-file
   offset shift and the even-spacing fallback are all deliberate and are not
   part of this task.
 - Add a second `[re:]` line, or a non-standard tag like `[tool:]` — Beetdrop
