@@ -34,6 +34,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+__version__ = "1.0.0"
+
+# Name written into the ``[re:...]`` provenance tag of every converted file.
+WRITER = "lrc-align"
+
 AUDIO_EXTENSIONS = {
     ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma",
     ".aiff", ".aif", ".alac", ".wv", ".ape", ".mp4",
@@ -149,6 +154,9 @@ LINE_TS_RE = re.compile(r"\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\]")
 WORD_TS_RE = re.compile(r"<(\d+):(\d{1,2})(?:[.:](\d{1,3}))?>")
 # ID tags such as [ar:Artist], [ti:Title], [offset:+200]
 META_RE = re.compile(r"^\s*\[([A-Za-z#][^\]:]*):([^\]]*)\]\s*$")
+# The standard "program that created this file" id tag.  Beetdrop reads it as
+# ``writer version source timing`` and only looks at the first one.
+PROVENANCE_RE = re.compile(r"^\s*\[re:([^\]]*)\]\s*$")
 ZIP_ESCAPE_RE = re.compile(r"#U([0-9A-Fa-f]{4})")
 
 # An alignment function receives the absolute window (seconds) inside the current
@@ -983,6 +991,32 @@ def output_path_for(lrc: Path, lyrics_dir: Path, output_dir: Path, recursive: bo
     return output_dir / lrc.name
 
 
+def stamp_provenance(out_lines: Sequence[str]) -> List[str]:
+    """Put this tool's ``[re:...]`` tag at the top of a converted file.
+
+    Any existing ``[re:...]`` line is removed rather than copied through: it
+    would otherwise still name whoever wrote the line-level file and claim the
+    timing is line-level, which is no longer true.  Where that old tag named a
+    source for the words it is kept as a fifth field (``from-<source>``),
+    which readers ignore.  The timing field describes the file actually
+    written, so a file that somehow ends up without word tags says ``line``.
+    """
+    old_payload: Optional[List[str]] = None
+    kept: List[str] = []
+    for line in out_lines:
+        m = PROVENANCE_RE.match(line)
+        if m:
+            if old_payload is None:
+                old_payload = m.group(1).split()
+            continue
+        kept.append(line)
+    timing = "word" if any(WORD_TS_RE.search(line) for line in kept) else "line"
+    fields = [WRITER, __version__, "align", timing]
+    if old_payload and len(old_payload) >= 3 and old_payload[2] and old_payload[2] != "align":
+        fields.append(f"from-{old_payload[2]}")
+    return [f"[re:{' '.join(fields)}]"] + kept
+
+
 def convert_file(
     lrc_path: Path,
     audio_path: Path,
@@ -1009,6 +1043,8 @@ def convert_file(
         lines, aligner.make_align_fn(lang), audio_duration=duration,
         decimals=detect_decimals(lines), should_stop=should_stop, retime_lines=retime_lines,
     )
+
+    new_lines = stamp_provenance(new_lines)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.resolve() == lrc_path.resolve():

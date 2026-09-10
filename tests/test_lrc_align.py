@@ -525,6 +525,83 @@ class FakeAligner:
         return fake_align()
 
 
+class ProvenanceTests(unittest.TestCase):
+    """Every converted file carries a [re:lrc-align <version> align word] tag."""
+
+    def convert(self, text, tmp):
+        music = Path(tmp)
+        (music / "Song.mp3").write_bytes(b"")
+        (music / "Song.lrc").write_text(text, encoding="utf-8")
+        out = music / "out" / "Song.lrc"
+        result = la.convert_file(music / "Song.lrc", music / "Song.mp3", FakeAligner(), out)
+        self.assertEqual(result.status, "converted")
+        return out.read_text(encoding="utf-8")
+
+    @staticmethod
+    def tags(content):
+        return [m.group(1).split() for line in content.splitlines() if (m := la.PROVENANCE_RE.match(line))]
+
+    def test_converted_file_has_exactly_one_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            content = self.convert(LINE_FILE, tmp)
+        tags = self.tags(content)
+        self.assertEqual(tags, [["lrc-align", la.__version__, "align", "word"]])
+        self.assertTrue(content.startswith("[re:lrc-align "), content[:60])
+        # The tag comes before the first timestamped line.
+        first_ts = next(i for i, l in enumerate(content.splitlines()) if la.LINE_TS_RE.match(l))
+        self.assertLess(0, first_ts)
+
+    def test_existing_tag_is_replaced_not_duplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            content = self.convert("[re:beetdrop 0.62.0 apple line]\n" + LINE_FILE, tmp)
+        self.assertNotIn("beetdrop", content)
+        self.assertEqual(self.tags(content), [["lrc-align", la.__version__, "align", "word", "from-apple"]])
+
+    def test_input_without_tag_gets_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            content = self.convert(LINE_FILE, tmp)
+        self.assertEqual(len(self.tags(content)), 1)
+
+    def test_tagging_changes_nothing_else(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            content = self.convert("[re:beetdrop 0.62.0 apple line]\n" + LINE_FILE, tmp)
+        lines = la.parse_lrc("[re:beetdrop 0.62.0 apple line]\n" + LINE_FILE)
+        untagged, _ = la.convert_lines(lines, FakeAligner().make_align_fn("en"), audio_duration=200.0,
+                                       decimals=la.detect_decimals(lines))
+        untagged = [l for l in untagged if not la.PROVENANCE_RE.match(l)]
+        stripped = [l for l in content.splitlines() if not la.PROVENANCE_RE.match(l)]
+        self.assertEqual(stripped, untagged)
+
+    def test_skipped_word_level_file_is_byte_identical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            music = Path(tmp)
+            (music / "Word.mp3").write_bytes(b"")
+            original = ("[re:beetdrop 0.62.0 apple word]\n" + WORD_FILE).encode("utf-8")
+            (music / "Word.lrc").write_bytes(original)
+            summary = la.process_library(music, music, music, FakeAligner(), log=lambda m: None)
+            self.assertEqual(summary.count("skipped_word_level"), 1)
+            self.assertEqual((music / "Word.lrc").read_bytes(), original)
+            self.assertFalse((music / "Word.lrc.bak").exists())
+
+    def test_converting_twice_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            music = Path(tmp)
+            (music / "Song.mp3").write_bytes(b"")
+            (music / "Song.lrc").write_text(LINE_FILE)
+            la.process_library(music, music, music, FakeAligner(), log=lambda m: None)
+            first = (music / "Song.lrc").read_bytes()
+            self.assertEqual(len(self.tags(first.decode())), 1)
+            summary = la.process_library(music, music, music, FakeAligner(), log=lambda m: None)
+            self.assertEqual(summary.count("converted"), 0)
+            self.assertEqual((music / "Song.lrc").read_bytes(), first)
+
+    def test_timing_field_describes_the_file(self):
+        self.assertEqual(la.stamp_provenance(["[ar:x]", "[00:10.00] plain"]),
+                         ["[re:lrc-align %s align line]" % la.__version__, "[ar:x]", "[00:10.00] plain"])
+        self.assertEqual(la.stamp_provenance(["[re:a b c d]", "[re:second]", "[00:10.00]<00:10.00>w"]),
+                         ["[re:lrc-align %s align word from-c]" % la.__version__, "[00:10.00]<00:10.00>w"])
+
+
 class ProcessLibraryTests(unittest.TestCase):
     def test_process_library_skips_and_converts(self):
         with tempfile.TemporaryDirectory() as tmp:
