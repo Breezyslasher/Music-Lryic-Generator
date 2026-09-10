@@ -105,6 +105,8 @@ def run_gui() -> None:
             self.recursive_var = tk.BooleanVar(value=False)
             self.retime_var = tk.BooleanVar(value=True)
             self.reconvert_var = tk.BooleanVar(value=False)
+            self.only_flagged_var = tk.BooleanVar(value=False)
+            self.report_path = tk.StringVar()
             self.status_text = tk.StringVar(
                 value="Pick the folder with your songs. Lyrics/output default to the same folder.")
             self.stop_event = threading.Event()
@@ -143,6 +145,15 @@ def run_gui() -> None:
                             variable=self.retime_var).pack(anchor=tk.W, pady=(0, 4))
             ttk.Checkbutton(frm, text="Re-do files this tool converted before (uses the .lrc.bak originals)",
                             variable=self.reconvert_var).pack(anchor=tk.W, pady=(0, 4))
+            flagged = ttk.Frame(frm)
+            flagged.pack(fill=tk.X, pady=(0, 4))
+            ttk.Checkbutton(flagged, text="Only files flagged in a report (redone from .lrc.bak, e.g. with a bigger model):",
+                            variable=self.only_flagged_var).pack(side=tk.LEFT)
+            ttk.Entry(flagged, textvariable=self.report_path, width=28).pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                                                              padx=(4, 0))
+            ttk.Button(flagged, text="Browse", command=self.browse_report).pack(side=tk.LEFT)
+            ttk.Label(frm, text="    (leave the report path blank to use the report in the output folder)",
+                      foreground="gray").pack(anchor=tk.W)
 
             btns = ttk.Frame(frm)
             btns.pack(pady=10)
@@ -173,6 +184,13 @@ def run_gui() -> None:
             folder = filedialog.askdirectory(title="Select Lyrics Folder")
             if folder:
                 self.lyrics_dir.set(folder)
+
+        def browse_report(self):
+            path = filedialog.askopenfilename(title="Select a conversion report",
+                                              filetypes=[("Report", "*.txt"), ("All files", "*")])
+            if path:
+                self.report_path.set(path)
+                self.only_flagged_var.set(True)
 
         def browse_output(self):
             folder = filedialog.askdirectory(title="Select Output Folder")
@@ -233,6 +251,17 @@ def run_gui() -> None:
                         "Each original is kept as <name>.lrc.bak. Continue?"):
                     return
 
+            only = None
+            if self.only_flagged_var.get():
+                report = Path(self.report_path.get().strip() or Path(output) / lrc_align.REPORT_NAME)
+                if not report.is_file():
+                    messagebox.showerror("Error", f"Report not found:\n{report}")
+                    return
+                only = lrc_align.flagged_names_from_report(report)
+                if not only:
+                    messagebox.showinfo("Nothing flagged", f"No flagged files listed in {report.name}.")
+                    return
+
             self.stop_event.clear()
             self.start_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
@@ -240,7 +269,7 @@ def run_gui() -> None:
             self.progress.configure(value=0)
             self.status_text.set("Loading model...")
             self.worker = threading.Thread(
-                target=self.run, args=(Path(audio), Path(lyrics), Path(output)), daemon=True)
+                target=self.run, args=(Path(audio), Path(lyrics), Path(output), only), daemon=True)
             self.worker.start()
 
         def stop(self):
@@ -248,9 +277,11 @@ def run_gui() -> None:
             self.set_status("Stopping after the current file...")
             self.stop_btn.config(state=tk.DISABLED)
 
-        def run(self, audio_dir, lyrics_dir, output_dir):
+        def run(self, audio_dir, lyrics_dir, output_dir, only=None):
             try:
                 model = self.model_var.get()
+                if only is not None:
+                    self.log(f"Limiting this run to {len(only)} flagged file(s).")
                 self.log(f"Loading Whisper model '{model}'...")
                 aligner = lrc_align.WhisperLineAligner(model)
                 self.log(f"Model loaded on {aligner.device}.")
@@ -262,7 +293,8 @@ def run_gui() -> None:
                     log=self.log, progress=self.set_progress,
                     should_stop=self.stop_event.is_set,
                     retime_lines=self.retime_var.get(),
-                    reconvert=self.reconvert_var.get(),
+                    reconvert=self.reconvert_var.get() or only is not None,
+                    only=only,
                 )
                 self.log("Done: " + summary.describe())
                 self.set_status("Finished: " + summary.describe())
