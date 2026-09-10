@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 # Name written into the ``[re:...]`` provenance tag of every converted file.
 WRITER = "lrc-align"
@@ -74,9 +74,16 @@ SPAN_PACE_FACTOR = 2.5
 # up to about 4x the song's pace, never more.
 GAP_PACE_FACTOR = 4.0
 GAP_FLOOR = 2.5
-# Mean aligner word confidence below which a file is flagged in the report
-# (loud or screamed vocals the model cannot follow well).
-LOW_CONFIDENCE = 0.5
+# Mean aligner word confidence: below LOW the timing is rough (loud or unclear
+# vocals, a bigger model may help); below VERY_LOW the aligner could not follow
+# the vocal at all, which nearly always means the lyrics do not match this
+# recording (a different edit, a live version, the wrong song).
+LOW_CONFIDENCE = 0.45
+VERY_LOW_CONFIDENCE = 0.3
+# Consecutive words the aligner places closer than this were not really heard
+# apart (a sung word takes longer); they are treated as a tie and spread
+# evenly up to the next distinct time, like exact ties.
+NEAR_TIE = 0.05
 
 
 def line_span_cap(n_words: int) -> float:
@@ -398,7 +405,7 @@ def finalize_word_times(
     clamped = [max(float(t), line_start) if upper is None else min(max(float(t), line_start), upper)
                for t in filled]
     clamped[0] = line_start
-    out = spread_ties(pool_adjacent_violators(clamped), line_start, line_end)
+    out = spread_ties(merge_near_ties(pool_adjacent_violators(clamped)), line_start, line_end)
     for k in range(1, n):
         if out[k] <= out[k - 1]:
             out[k] = out[k - 1] + MIN_WORD_STEP
@@ -417,6 +424,25 @@ def pool_adjacent_violators(values: Sequence[float]) -> List[float]:
     out: List[float] = []
     for s, c in blocks:
         out.extend([s / c] * c)
+    return out
+
+
+def merge_near_ties(values: Sequence[float], tolerance: float = NEAR_TIE) -> List[float]:
+    """Snap words within ``tolerance`` of a group's first word onto that word.
+
+    The aligner often reports a cluster of short words at the same instant,
+    10 to 20 ms apart.  Anchoring to the group's first value (not the previous
+    one) keeps a run of legitimately close words from chaining together.
+    """
+    out = list(values)
+    i = 0
+    while i < len(out):
+        j = i
+        while j + 1 < len(out) and out[j + 1] - out[i] < tolerance:
+            j += 1
+        for k in range(i + 1, j + 1):
+            out[k] = out[i]
+        i = j + 1
     return out
 
 
@@ -479,6 +505,26 @@ def enforce_increasing(times: Sequence[float], step: float) -> Tuple[List[float]
     return out, forced
 
 
+def fit_before(times: Sequence[float], limit: float, step: float) -> List[float]:
+    """Pull trailing words back so the line ends by ``limit`` where possible.
+
+    ``enforce_increasing`` can push a cluster at the end of a line past the
+    next line's tag.  Words are moved back to leave ``step`` between each,
+    never before their predecessor; a line that cannot fit at all is left to
+    overflow (it has already been counted as forced).
+    """
+    out = list(times)
+    n = len(out)
+    for k in range(n - 1, 0, -1):
+        cap = limit - step * (n - 1 - k)
+        if out[k] > cap:
+            out[k] = cap
+    for k in range(1, n):
+        if out[k] < out[k - 1] + step:
+            out[k] = out[k - 1] + step
+    return out
+
+
 def build_word_line(tag: str, tokens: Sequence[str], times: Sequence[float], decimals: int = 2) -> str:
     parts = [f"<{format_timestamp(t, decimals)}>{tok}" for tok, t in zip(tokens, times)]
     return f"{tag}{' '.join(parts)}"
@@ -498,6 +544,8 @@ class ConvertStats:
     # because the line has more words than its time can hold (their timing
     # is evenly forced, not heard).
     lines_forced: int = 0
+    # The lyric file's own line timestamps go backwards somewhere.
+    source_out_of_order: bool = False
     # Whole-file shift applied because the lyrics were timed to a different
     # edit of the song (0 when not needed).
     global_offset: float = 0.0
@@ -554,6 +602,19 @@ def next_line_start(lines: Sequence[LrcLine], start: float) -> Optional[float]:
     return min(later) if later else None
 
 
+def shared_tags(lines: Sequence[LrcLine]) -> set:
+    """Timestamps used by more than one timed line (a duet, a translation line).
+
+    Moving one of the pair and not the other would put them out of order, so
+    such lines keep their tags.
+    """
+    seen: Dict[float, int] = {}
+    for ln in lines:
+        if ln.start is not None:
+            seen[ln.start] = seen.get(ln.start, 0) + 1
+    return {t for t, n in seen.items() if n > 1}
+
+
 def make_room_for_tails(lines: Sequence[LrcLine], raw_times: Dict[int, List[Optional[float]]],
                         eff_start: Dict[int, float]) -> int:
     """Push an early tag later when the previous line's last word needs the room.
@@ -563,10 +624,11 @@ def make_room_for_tails(lines: Sequence[LrcLine], raw_times: Dict[int, List[Opti
     in place.
     """
     moved = 0
+    shared = shared_tags(lines)
     order = sorted(raw_times, key=lambda i: lines[i].start)
     for a, b in zip(order, order[1:]):
         ra, rb = raw_times[a], raw_times[b]
-        if alignment_is_poor(ra) or alignment_is_poor(rb):
+        if alignment_is_poor(ra) or alignment_is_poor(rb) or lines[b].start in shared:
             continue
         last_a = next((t for t in reversed(ra) if t is not None), None)
         first_b = next((t for t in rb if t is not None), None)
@@ -608,7 +670,9 @@ def retimed_line_start(first_word: Optional[float], tag_start: float, next_start
     new_start = min(first_word, tag_start + MAX_LATE_SHIFT)
     if next_start is not None:
         new_start = min(new_start, next_start - MAX_EARLY_SHIFT - MIN_WORD_STEP)
-    return max(new_start, tag_start - MAX_EARLY_SHIFT, 0.0)
+    # Lines closer than the bound above would otherwise be pulled EARLIER than
+    # their own tag; a tag is never moved earlier.
+    return max(new_start, tag_start)
 
 
 def line_windows(lines: Sequence[LrcLine], audio_duration: Optional[float]) -> Dict[int, Tuple[float, float]]:
@@ -760,8 +824,11 @@ def convert_lines(
             stats2.global_offset = amount
             return output, stats2
         if mode in ("global", "per_line"):
+            shared = shared_tags(lines)
             for idx, first in first_words.items():
                 start = float(lines[idx].start)
+                if start in shared:
+                    continue
                 new_start = retimed_line_start(first - FIRST_WORD_BIAS, start, next_line_start(lines, start))
                 if abs(new_start - start) >= 0.005:
                     stats.lines_retimed += 1
@@ -794,7 +861,9 @@ def convert_lines(
             final_times = cap_line_span(final_times, pace=pace)
         # Every transformation above may squeeze words together; the pass that
         # feeds the formatter is the one that must guarantee distinct tags.
-        final_times, forced = enforce_increasing(final_times, min_printed_step(decimals))
+        step = min_printed_step(decimals)
+        final_times, forced = enforce_increasing(final_times, step)
+        final_times = fit_before(final_times, end - step, step)
         if forced:
             stats.lines_forced += 1
         tag = line.tag if abs(start - line.start) < 0.005 else f"[{format_timestamp(start, decimals)}]"
@@ -881,6 +950,24 @@ def find_ffmpeg() -> Optional[str]:
         return None
 
 
+def describe_ffmpeg_error(stderr: str) -> str:
+    """Pick the line of ffmpeg's output that says what went wrong."""
+    text = stderr.lower()
+    if "does not contain any stream" in text or "output file is empty" in text:
+        return "no audio stream in this file (is it a video without sound?)"
+    if "no such file" in text:
+        return "file not found"
+    if "permission denied" in text:
+        return "permission denied"
+    hints = ("invalid data", "error", "not found", "unknown", "failed", "unsupported", "could not", "moov atom")
+    for line in reversed(stderr.strip().splitlines()):
+        low = line.lower()
+        if any(h in low for h in hints) and "version" not in low:
+            return line.strip()[-200:]
+    tail = [ln.strip() for ln in stderr.strip().splitlines() if ln.strip()]
+    return tail[-1][-200:] if tail else "unknown error"
+
+
 def load_audio(path: Path, sample_rate: int = SAMPLE_RATE):
     """Decode any audio file to a mono float32 numpy array at 16 kHz."""
     import numpy as np
@@ -898,7 +985,7 @@ def load_audio(path: Path, sample_rate: int = SAMPLE_RATE):
     try:
         out = subprocess.run(cmd, capture_output=True, check=True).stdout
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to decode audio: {e.stderr.decode(errors='ignore').strip()[-500:]}") from e
+        raise RuntimeError(f"Failed to decode audio: {describe_ffmpeg_error(e.stderr.decode(errors='ignore'))}") from e
     return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
 
 
@@ -996,28 +1083,49 @@ class FileResult:
     message: str = ""
 
     def flags(self) -> List[str]:
-        """Reasons a person should look at this file."""
-        out: List[str] = []
+        """Reasons a person should look at this file (see ``severity``)."""
+        return [text for _, text in self._flags()]
+
+    def severity(self) -> Optional[str]:
+        """``"check"`` when the file is probably wrong (lyrics that do not
+        match the recording, a failure), ``"listen"`` when the timing is
+        merely rough, ``None`` when nothing needs attention."""
+        levels = [lvl for lvl, _ in self._flags()]
+        if "check" in levels:
+            return "check"
+        return "listen" if levels else None
+
+    def _flags(self) -> List[Tuple[str, str]]:
+        out: List[Tuple[str, str]] = []
         if self.status == "failed":
-            out.append(f"failed: {self.message}")
+            out.append(("check", f"failed: {self.message}"))
         elif self.status == "skipped_no_audio":
-            out.append("no matching audio file")
+            out.append(("check", "no matching audio file"))
         elif self.status == "converted" and self.stats:
             s = self.stats
-            if abs(s.global_offset) >= 0.005:
-                out.append(f"lyrics shifted {s.global_offset:+.2f} s to match the audio "
-                           "(lyric file timed to a different edit of the song?)")
             aligned = s.lines_aligned + s.lines_fallback
+            if abs(s.global_offset) >= 1.0:
+                out.append(("check", f"lyrics shifted {s.global_offset:+.2f} s to match the audio "
+                                     "(lyric file timed to a different edit of the song?)"))
+            elif abs(s.global_offset) >= 0.5:
+                out.append(("listen", f"lyrics shifted {s.global_offset:+.2f} s to match the audio"))
             if s.lines_fallback and aligned and s.lines_fallback / aligned >= 0.2:
-                out.append(f"{s.lines_fallback} of {aligned} lines could not be aligned and were spaced evenly")
-            elif s.lines_fallback:
-                out.append(f"{s.lines_fallback} line(s) could not be aligned and were spaced evenly")
+                out.append(("check", f"{s.lines_fallback} of {aligned} lines could not be aligned and were "
+                                     "spaced evenly (do these lyrics match this recording?)"))
+            elif s.lines_fallback >= 3:
+                out.append(("listen", f"{s.lines_fallback} line(s) could not be aligned and were spaced evenly"))
             if s.lines_forced and aligned and (s.lines_forced >= 3 or s.lines_forced / aligned >= 0.1):
-                out.append(f"{s.lines_forced} line(s) have more words than their time can hold; "
-                           "their word spacing was forced, not heard")
-            if s.confidence is not None and s.confidence < LOW_CONFIDENCE:
-                out.append(f"low alignment confidence ({s.confidence:.2f}); word timing may be rough "
-                           "(loud or unclear vocals?) - try a larger model")
+                out.append(("listen", f"{s.lines_forced} line(s) have more words than their time can hold; "
+                                      "their word spacing was forced, not heard"))
+            if s.confidence is not None and s.confidence < VERY_LOW_CONFIDENCE:
+                out.append(("check", f"very low alignment confidence ({s.confidence:.2f}); the aligner could "
+                                     "not follow the vocal - do these lyrics match this recording?"))
+            elif s.confidence is not None and s.confidence < LOW_CONFIDENCE:
+                out.append(("listen", f"low alignment confidence ({s.confidence:.2f}); word timing may be rough "
+                                      "(loud or unclear vocals?) - try a larger model"))
+            if s.source_out_of_order:
+                out.append(("listen", "the lyric file's own line timestamps go backwards somewhere; "
+                                      "those lines cannot be placed correctly"))
         return out
 
 
@@ -1065,13 +1173,21 @@ def write_report(summary: Summary, output_dir: Path, name: str = REPORT_NAME) ->
     """Write a plain-text report with the files worth checking listed first."""
     lines = ["LRC line-to-word conversion report", summary.describe(), ""]
     flagged = summary.flagged()
+    check = [r for r in flagged if r.severity() == "check"]
+    listen = [r for r in flagged if r.severity() == "listen"]
     lines.append(f"FLAGGED ({len(flagged)}) - worth checking by hand:")
     if not flagged:
         lines.append("  none")
-    for r in flagged:
-        lines.append(f"  {r.lrc.name}")
-        for f in r.flags():
-            lines.append(f"      - {f}")
+    for title, group in ((f"CHECK FIRST ({len(check)}) - probably wrong: lyrics that do not match the recording, "
+                          "failures", check),
+                         (f"WORTH A LISTEN ({len(listen)}) - converted, but the timing may be rough", listen)):
+        if not group:
+            continue
+        lines.append(title + ":")
+        for r in group:
+            lines.append(f"  {r.lrc.name}")
+            for f in r.flags():
+                lines.append(f"      - {f}")
     lines += ["", "ALL FILES:"]
     for r in summary.results:
         detail = ""
@@ -1183,6 +1299,9 @@ def convert_file(
     if is_word_level(lines):
         return FileResult(lrc_path, "skipped_word_level")
 
+    timed = [ln.start for ln in lines if ln.start is not None]
+    out_of_order = any(b < a for a, b in zip(timed, timed[1:]))
+
     duration = aligner.load_file(audio_path)
     lang = language
     if not lang or lang == "auto":
@@ -1194,6 +1313,7 @@ def convert_file(
         decimals=detect_decimals(lines), should_stop=should_stop, retime_lines=retime_lines,
     )
 
+    stats.source_out_of_order = out_of_order
     new_lines = stamp_provenance(new_lines)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
