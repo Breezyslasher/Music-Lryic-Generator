@@ -1,52 +1,125 @@
-# Description
-This program is used to automatically create lyric files for your music collection to use on apps like Plex or Music Assistant.
+# LRC Line-to-Word Converter
+
+Turns line-by-line `.lrc` lyric files into word-by-word (enhanced) `.lrc` files
+for apps like Plex or Music Assistant.
+
+The tool does **not** transcribe your songs. Whisper transcriptions get words
+wrong; your existing lyric files already have the right words. Instead, it takes
+each timed line and force-aligns that exact text against the piece of the audio
+that belongs to the line (from the line's timestamp up to the next line's
+timestamp). Every word then gets its own inline timestamp:
+
+```
+[00:28.90] I got a feeling that tonight's gonna be a good night
+```
+
+becomes
+
+```
+[00:28.90]<00:28.90>I <00:29.34>got <00:29.62>a <00:29.81>feeling <00:32.99>that <00:33.24>tonight's <00:33.95>gonna <00:34.47>be <00:34.93>a <00:35.42>good <00:35.88>night
+```
+
+What the tool keeps and skips:
+
+- Files that are already word-by-word are skipped untouched.
+- Line timestamps are never changed; the first word always gets the line's time.
+- Metadata tags (`[ar:...]`, `[ti:...]`), blank lines and instrumental markers
+  (a timestamp with no text) are copied through as they are.
+- In a mixed file, lines that already have word tags are kept and only the
+  plain lines are converted.
+- If the aligner cannot place a line, its words are spread evenly from the line
+  timestamp and the log says so.
 
 ## Setup
 
 ### 1. Install Python
-Make sure you have Python 3.8 or newer installed on your system.
 
-    https://www.python.org/downloads/
-
-Verify installation:
+Python 3.8 or newer: https://www.python.org/downloads/
 
     python --version
 
- 
- 
-### 2. Install Required Python Packages
-The script needs:
+### 2. Install ffmpeg
 
-whisper (OpenAI’s Whisper ASR model)
+Whisper needs ffmpeg to decode audio. Either install it and add it to your
+PATH, or install the bundled copy with pip (included in `requirements.txt`):
 
-torch (PyTorch for running Whisper)
+    pip install imageio-ffmpeg
 
-tqdm (progress bar)
+### 3. Install the Python packages
 
-Install them with:
+    pip install -r requirements.txt
 
-    pip install torch tqdm git+https://github.com/openai/whisper.git
+This installs `torch`, `openai-whisper`, `stable-ts` (the forced aligner),
+`tqdm` and `imageio-ffmpeg`.
 
-Note:
+For GPU support install the PyTorch build matching your CUDA version from
+https://pytorch.org first, then run the command above. On CPU-only machines the
+command above installs CPU PyTorch.
 
-For GPU support, install the correct PyTorch version from pytorch.org matching your CUDA version 
+## Usage
 
-On CPU-only machines, the above will install CPU PyTorch.
+### GUI
 
+    python Lryics.py
 
+1. **Audio folder**: the folder with your songs.
+2. **Lyrics folder**: where the `.lrc` files are. Leave blank if they sit next
+   to the songs (the usual Plex layout).
+3. **Output folder**: where converted files go. Leave blank to overwrite in
+   place; each original is kept as `<name>.lrc.bak`.
+4. Pick a Whisper model and language, tick "Include sub-folders" for a whole
+   library, then press **Start Conversion**. **Stop** finishes the current file
+   and halts.
 
+The first run downloads the Whisper model.
 
-### 3. Run the Script
-When the script is run for the first time, it will download the whisper model.
+### Command line
+
+    python Lryics.py --audio "D:/Music" --lyrics "D:/Lyrics" --output "D:/Lyrics/word" --model base --recursive
+
+| Option | Meaning |
+| --- | --- |
+| `--audio DIR` | folder with the audio files (required for CLI mode) |
+| `--lyrics DIR` | folder with the `.lrc` files (default: the audio folder) |
+| `--output DIR` | output folder (default: in place, originals kept as `.lrc.bak`) |
+| `--model NAME` | `tiny`, `base`, `small`, `medium`, `large`, `large-v3`, `turbo` (default `base`) |
+| `--language CODE` | lyric language, or `auto` to detect per song (default `en`) |
+| `--device cpu|cuda` | force a device (default: auto) |
+| `-r`, `--recursive` | include sub-folders; the folder structure is mirrored in the output |
+
+### Matching lyrics to audio
+
+A lyric file is matched to the audio file with the same name (`Song.lrc` ->
+`Song.mp3`). Matching ignores case, extra spaces and `#U2019`-style escapes
+that some zip tools write for characters such as `’`. Lyric files with no
+matching audio are skipped and listed in the log.
+
+## Tips
+
+- `base` is a good balance of speed and accuracy. `small` or `medium` place
+  words more precisely on busy mixes but are slower; `turbo` is fast on a GPU.
+- Running the tool again on the same folders is safe: files that are already
+  word-by-word, including previous output, are skipped.
+- Loud instrumentals make alignment harder. Lines that fell back to even
+  spacing are counted in the log so you can check them.
 
 ## Troubleshooting
 
-###1. Slow Download of Model
-You can manually download the model from https://github.com/openai/whisper/blob/main/whisper/__init__.py 
+### Slow model download
 
+You can manually download the model from the URLs in
+https://github.com/openai/whisper/blob/main/whisper/__init__.py and put it in
 
-Put the downloaded model in
-    
-    Windows: C:\Users\<username>\.cache\whisper\<model>
-    Linux: /home/<username>/.cache/whisper/<model>
+    Windows: C:\Users\<username>\.cache\whisper\<model>.pt
+    Linux:   /home/<username>/.cache/whisper/<model>.pt
 
+### "ffmpeg was not found"
+
+Install ffmpeg and add it to PATH, or run `pip install imageio-ffmpeg`.
+
+## Development
+
+The parsing, timing and file matching logic lives in `lrc_align.py` and has no
+GUI or torch dependency, so the tests run without a model:
+
+    python -m unittest discover -s tests

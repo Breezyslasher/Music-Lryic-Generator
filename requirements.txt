@@ -1,0 +1,5 @@
+torch
+openai-whisper
+stable-ts>=2.17
+tqdm
+imageio-ffmpeg
