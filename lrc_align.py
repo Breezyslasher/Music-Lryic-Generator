@@ -34,14 +34,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 # Name written into the ``[re:...]`` provenance tag of every converted file.
 WRITER = "lrc-align"
 
+# Video containers (.mp4, .m4v, .mkv, .webm) are deliberately absent: a music
+# video filed under the music root would otherwise be matched as a track's
+# audio, and one without a sound track cannot be decoded at all.
 AUDIO_EXTENSIONS = {
     ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma",
-    ".aiff", ".aif", ".alac", ".wv", ".ape", ".mp4",
+    ".aiff", ".aif", ".alac", ".wv", ".ape",
 }
 
 SAMPLE_RATE = 16000
@@ -84,6 +87,15 @@ VERY_LOW_CONFIDENCE = 0.3
 # apart (a sung word takes longer); they are treated as a tie and spread
 # evenly up to the next distinct time, like exact ties.
 NEAR_TIE = 0.05
+# A written line counts as "forced" (its spacing invented, not heard) when
+# any gap sits at the minimum printed step or more than one gap is under
+# this.  Measured on the written times, so it cannot disagree with the file.
+# Calibration over a library: Apple's word-level files trip this rule on
+# 0.03% of lines.
+CROWDED_GAP = 0.05
+# When at least this share of a file's lines could not be aligned, most of
+# its word timing would be invented: the file is not written at all.
+UNALIGNED_SKIP_FRACTION = 0.5
 
 
 def line_span_cap(n_words: int) -> float:
@@ -505,6 +517,16 @@ def enforce_increasing(times: Sequence[float], step: float) -> Tuple[List[float]
     return out, forced
 
 
+def line_is_crowded(times: Sequence[float], step: float) -> bool:
+    """Whether a line's written word times show forced rather than heard spacing."""
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    if not gaps:
+        return False
+    if any(g <= step + 1e-9 for g in gaps):
+        return True
+    return sum(1 for g in gaps if g < CROWDED_GAP) > 1
+
+
 def fit_before(times: Sequence[float], limit: float, step: float) -> List[float]:
     """Pull trailing words back so the line ends by ``limit`` where possible.
 
@@ -862,9 +884,11 @@ def convert_lines(
         # Every transformation above may squeeze words together; the pass that
         # feeds the formatter is the one that must guarantee distinct tags.
         step = min_printed_step(decimals)
-        final_times, forced = enforce_increasing(final_times, step)
+        final_times, _ = enforce_increasing(final_times, step)
         final_times = fit_before(final_times, end - step, step)
-        if forced:
+        # Count what was written, not which branch ran: a line whose gaps sit
+        # at the floor is forced however it got there.
+        if line_is_crowded(final_times, step):
             stats.lines_forced += 1
         tag = line.tag if abs(start - line.start) < 0.005 else f"[{format_timestamp(start, decimals)}]"
         output.append(build_word_line(tag, tokens_by_idx[idx], final_times, decimals))
@@ -1076,7 +1100,7 @@ class WhisperLineAligner:
 @dataclass
 class FileResult:
     lrc: Path
-    status: str                     # converted | skipped_word_level | skipped_no_audio | skipped_no_lyrics | failed
+    status: str   # converted | skipped_word_level | skipped_no_audio | skipped_no_lyrics | skipped_unaligned | failed
     output: Optional[Path] = None
     audio: Optional[Path] = None
     stats: Optional[ConvertStats] = None
@@ -1101,6 +1125,8 @@ class FileResult:
             out.append(("check", f"failed: {self.message}"))
         elif self.status == "skipped_no_audio":
             out.append(("check", "no matching audio file"))
+        elif self.status == "skipped_unaligned":
+            out.append(("check", f"not written: {self.message} - do these lyrics match this recording?"))
         elif self.status == "converted" and self.stats:
             s = self.stats
             aligned = s.lines_aligned + s.lines_fallback
@@ -1142,6 +1168,7 @@ class Summary:
             f"already word-by-word {self.count('skipped_word_level')}, "
             f"no matching audio {self.count('skipped_no_audio')}, "
             f"no lyrics {self.count('skipped_no_lyrics')}, "
+            f"not written (could not be aligned) {self.count('skipped_unaligned')}, "
             f"failed {self.count('failed')}"
         )
 
@@ -1314,6 +1341,12 @@ def convert_file(
     )
 
     stats.source_out_of_order = out_of_order
+    attempted = stats.lines_aligned + stats.lines_fallback
+    if attempted and stats.lines_fallback / attempted >= UNALIGNED_SKIP_FRACTION:
+        # Most of the timing would be invented: better no word-level file than
+        # a fake one.  The line-level original stays as it is.
+        return FileResult(lrc_path, "skipped_unaligned", audio=audio_path, stats=stats,
+                          message=f"{stats.lines_fallback} of {attempted} lines could not be aligned")
     new_lines = stamp_provenance(new_lines)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1406,7 +1439,9 @@ def process_library(
                     result = convert_file(lrc, audio, aligner, out_path, language, should_stop, retime_lines,
                                           content=content)
                     s = result.stats
-                    if s:
+                    if result.status == "skipped_unaligned":
+                        log(f"    NOT written: {result.message} - do the lyrics match this recording?")
+                    elif s:
                         extra = f", {s.lines_retimed} line time(s) adjusted" if s.lines_retimed else ""
                         if abs(s.global_offset) >= 0.005:
                             extra += f", whole file shifted {s.global_offset:+.2f} s"

@@ -28,7 +28,9 @@ What the tool keeps and skips:
 - In a mixed file, lines that already have word tags are kept and only the
   plain lines are converted.
 - If the aligner cannot place a line, its words are spread evenly from the line
-  timestamp and the log says so.
+  timestamp and the log says so. If that happens to half the file or more, the
+  file is not written at all: the line-level original stays as it is, and the
+  report says the lyrics probably do not match the recording.
 
 ## Setup
 

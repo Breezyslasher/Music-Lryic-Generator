@@ -582,11 +582,12 @@ class DistinctTagTests(unittest.TestCase):
         out, stats = la.convert_lines(lines, lambda s, e, t: [(w, 10.0, 10.0, .9) for w in t.split()])
         self.assert_distinct(out)
         self.assertEqual(stats.lines_forced, 1)
-        # With 0.3 s available the same words can be spaced honestly (21 ms).
+        # With 0.3 s available the tags are distinct without forcing, but 14
+        # words 21 ms apart is still invented spacing and is counted as such.
         lines = la.parse_lrc("[00:10.00] " + " ".join(f"w{i}" for i in range(14)) + "\n[00:10.30] next\n")
         out, stats = la.convert_lines(lines, lambda s, e, t: [(w, 10.0, 10.0, .9) for w in t.split()])
         self.assert_distinct(out)
-        self.assertEqual(stats.lines_forced, 0)
+        self.assertEqual(stats.lines_forced, 1)
 
     def test_distinct_with_three_decimals(self):
         lines = la.parse_lrc("[00:10.000] " + " ".join(f"w{i}" for i in range(14)) + "\n[00:10.010] next\n")
@@ -714,6 +715,103 @@ class LibraryRunFixesTests(unittest.TestCase):
         self.assertEqual(la.describe_ffmpeg_error("ffmpeg version 7.0\n[mov] moov atom not found\nx.m4a: Invalid data found when processing input"),
                          "x.m4a: Invalid data found when processing input")
         self.assertEqual(la.describe_ffmpeg_error("ffmpeg version 7.  5.100 /  7.  5.100"), "ffmpeg version 7.  5.100 /  7.  5.100")
+
+
+class RoundTwoTests(unittest.TestCase):
+    """Second full-library report: forced counted as a property, mostly-unaligned
+    files not written, video containers not matched as audio."""
+
+    @staticmethod
+    def printed(line):
+        return [m.group(0) for m in la.WORD_TS_RE.finditer(line)]
+
+    def test_one_step_apart_prints_differently_at_a_float_boundary(self):
+        # The Eminem case: a line starting at 64.27, words one step apart.
+        for decimals, text in ((2, "[01:04.27] Call it caught between\n[01:06.00] next\n"),
+                               (3, "[01:04.270] Call it caught between\n[01:06.000] next\n")):
+            lines = la.parse_lrc(text)
+            step = la.MIN_WORD_STEP
+            out, _ = la.convert_lines(lines, lambda s, e, t: [(w, 64.27 + i * step, 64.27 + i * step + 0.005, .9)
+                                                              for i, w in enumerate(t.split())],
+                                      decimals=decimals)
+            tags = self.printed(out[0])
+            self.assertEqual(len(tags), 4)
+            self.assertEqual(len(set(tags)), 4, out[0])
+
+    def test_forced_is_measured_on_the_written_line(self):
+        # Route 1: the explicit fallback spreads words 0.45 s apart -> not crowded.
+        lines = la.parse_lrc("[00:10.00] a b c d\n[00:20.00] next\n")
+        _, stats = la.convert_lines(lines, lambda s, e, t: [])
+        self.assertEqual(stats.lines_fallback, 2)
+        self.assertEqual(stats.lines_forced, 0)
+        # Route 2: aligned words compressed to the floor by a tight window -> crowded, counted.
+        lines = la.parse_lrc("[00:10.00] " + " ".join(f"w{i}" for i in range(12)) + "\n[00:10.12] next\n")
+        out, stats = la.convert_lines(lines, lambda s, e, t: [(w, 10.0 + i * 0.3, 10.0 + i * 0.3 + .1, .9)
+                                                              for i, w in enumerate(t.split())])
+        self.assertEqual(stats.lines_forced, 1)
+        self.assertEqual(len(set(self.printed(out[0]))), 12)
+        # Route 3: several near-floor gaps without any exactly at the step -> still crowded.
+        self.assertTrue(la.line_is_crowded([10.0, 10.03, 10.07, 10.5, 11.0], 0.015))
+        self.assertFalse(la.line_is_crowded([10.0, 10.03, 10.5, 11.0], 0.015))     # one close pair is fine
+        self.assertFalse(la.line_is_crowded([10.0, 10.3, 10.6], 0.015))
+        self.assertTrue(la.line_is_crowded([10.0, 10.015, 10.5], 0.015))           # at the floor
+
+    def test_mostly_unaligned_file_is_not_written(self):
+        # Like "01 Under The Sea": 73% of lines fell back although confidence was 0.65.
+        text = "".join(f"[00:{10 + 2 * k:02d}.00] line {k} words here\n" for k in range(15))
+        lines = la.parse_lrc(text)
+        good = {la.clean_text(l): l.start for l in lines if l.is_lyric}
+
+        def fn(start, end, txt):
+            out = []
+            for piece in txt.split("\n"):
+                t0 = good.get(piece.strip())
+                k = int(piece.split()[1]) if piece.strip() else 0
+                for j, w in enumerate(piece.split()):
+                    if t0 is None or k < 11:      # 11 of 15 lines cannot be placed: failed words
+                        out.append((w, 0.0, 0.0, 0.0))
+                    else:
+                        out.append((w, t0 + j * 0.3, t0 + j * 0.3 + 0.1, 0.65))
+            return out
+
+        class Al(FakeAligner):
+            def make_align_fn(self, language):
+                return fn
+        with tempfile.TemporaryDirectory() as tmp:
+            music = Path(tmp)
+            (music / "Song.mp3").write_bytes(b"")
+            (music / "Song.lrc").write_text(text)
+            out = music / "out" / "Song.lrc"
+            r = la.convert_file(music / "Song.lrc", music / "Song.mp3", Al(), out)
+            self.assertEqual(r.status, "skipped_unaligned")
+            self.assertFalse(out.exists())
+            self.assertEqual(r.severity(), "check")
+            self.assertIn("11 of 15", r.flags()[0])
+            self.assertGreater(r.stats.lines_aligned, 0)            # some lines did align (like Under The Sea)
+            # and the batch driver reports it
+            summary = la.process_library(music, music, music / "out", Al(), log=lambda m: None)
+            self.assertEqual(summary.count("skipped_unaligned"), 1)
+            self.assertIn("not written (could not be aligned) 1", summary.describe())
+            report = (music / "out" / la.REPORT_NAME).read_text()
+            self.assertIn("CHECK FIRST (1)", report)
+            self.assertIn("not written", report)
+            self.assertEqual((music / "Song.lrc").read_text(), text)   # original untouched
+
+    def test_video_containers_are_not_audio(self):
+        self.assertNotIn(".mp4", la.AUDIO_EXTENSIONS)
+        self.assertNotIn(".m4v", la.AUDIO_EXTENSIONS)
+        with tempfile.TemporaryDirectory() as tmp:
+            music = Path(tmp)
+            (music / "Song.mp4").write_bytes(b"")
+            (music / "Song.lrc").write_text(LINE_FILE)
+            self.assertIsNone(la.match_audio(music / "Song.lrc", la.index_audio(music, False), music, music))
+
+    def test_well_behaved_file_byte_identical(self):
+        lines = la.parse_lrc(LINE_FILE)
+        out, stats = la.convert_lines(lines, context_align(lines), audio_duration=200.0)
+        self.assertEqual(out[1], "[00:15.23]<00:15.23>Oh, <00:15.73>oh, <00:16.23>oh <00:16.73>oh <00:17.23>oh")
+        self.assertEqual(out[3], "[00:22.86]<00:22.86>I <00:23.36>guarantee <00:23.86>you'd <00:24.36>keep <00:24.86>it <00:25.36>secret")
+        self.assertEqual(stats.lines_forced, 0)
 
 
 class FileMatchingTests(unittest.TestCase):
