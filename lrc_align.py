@@ -44,8 +44,99 @@ SAMPLE_RATE = 16000
 # Longest audio window used for a single line.  Whisper works on 30 second
 # chunks, and a lyric line never needs more than that.
 MAX_LINE_WINDOW = 30.0
-# Audio included before the line timestamp so a clipped first consonant is not lost.
+# Audio included before the first line of a slice so a clipped consonant is not lost.
 LEAD_PAD = 0.15
+# Lead used when a line has no previous line to serve as context.
+LEAD_PAD_SOLO = 0.5
+# Neighbouring lines are aligned together with a line as context when their
+# tags are this close; audio after the next line's tag included as context.
+CONTEXT_GAP = 12.0
+CONTEXT_TAIL = 6.0
+# Audio after a line's tag when no next line is close enough to be context.
+SOLO_TAIL_MAX = 15.0
+# A line's words never spread over more than this: base + per-word seconds
+# from the first word's start to the last word's start.  In 251 professionally
+# timed lines across four songs none exceeded 1.0 + 0.4 s per word; the extra
+# allowance is for slow ballads.
+LINE_SPAN_BASE = 1.0
+LINE_SPAN_PER_WORD = 0.5
+# ...but slow ballads sing a word per second, so a line may also span up to
+# this many times the song's own typical seconds-per-word (median over lines).
+SPAN_PACE_FACTOR = 2.5
+# No single gap between two words of a line may exceed this many times the
+# song's pace (or the floor): a held note before an instrumental break tends to
+# drag the last word into the break.  Professional files show mid-line pauses
+# up to about 4x the song's pace, never more.
+GAP_PACE_FACTOR = 4.0
+GAP_FLOOR = 2.5
+# Mean aligner word confidence below which a file is flagged in the report
+# (loud or screamed vocals the model cannot follow well).
+LOW_CONFIDENCE = 0.5
+
+
+def line_span_cap(n_words: int) -> float:
+    return LINE_SPAN_BASE + LINE_SPAN_PER_WORD * max(1, n_words)
+
+
+def song_pace(raw_times: Iterable[Sequence[Optional[float]]]) -> Optional[float]:
+    """Median seconds per word across a song's aligned lines."""
+    paces = []
+    for times in raw_times:
+        known = [t for t in times if t is not None]
+        if len(known) >= 3 and not alignment_is_poor(times):
+            paces.append((known[-1] - known[0]) / (len(known) - 1))
+    if len(paces) < 3:      # too little to know the song's pace
+        return None
+    paces.sort()
+    n = len(paces)
+    return paces[n // 2] if n % 2 else (paces[n // 2 - 1] + paces[n // 2]) / 2
+
+
+def cap_line_span(times: List[float], n_words: Optional[int] = None, pace: Optional[float] = None) -> List[float]:
+    """Compress a line's word times proportionally when they spread too far."""
+    if len(times) < 2:
+        return times
+    n = n_words or len(times)
+    cap = line_span_cap(n)
+    if pace:
+        cap = max(cap, LINE_SPAN_BASE + SPAN_PACE_FACTOR * pace * (n - 1))
+    # Close single gaps that are far longer than the song ever pauses mid-line.
+    gap_cap = max(GAP_FLOOR, GAP_PACE_FACTOR * pace) if pace else GAP_FLOOR
+    times = list(times)
+    for k in range(1, len(times)):
+        excess = (times[k] - times[k - 1]) - gap_cap
+        if excess > 0:
+            for j in range(k, len(times)):
+                times[j] -= excess
+    span = times[-1] - times[0]
+    if span <= cap:
+        return times
+    t0 = times[0]
+    scale = cap / span
+    return [t0 + (t - t0) * scale for t in times]
+# When re-timing line tags to the sung first word, never move a tag earlier than
+# this or later than this relative to the original tag.  Lyric files tend to be
+# tagged a little early, while the aligner hears long sustained first notes a
+# little late, so the bounds are deliberately tight.
+MAX_EARLY_SHIFT = 0.3
+MAX_LATE_SHIFT = 0.35
+# Measured against a professionally timed file, the aligner hears the first
+# word of a line this much later than it really starts.
+FIRST_WORD_BIAS = 0.12
+# Tags already this close to the sung first word are left exactly as they are.
+# Lines are only ever moved LATER: lyric files run early far more often than
+# late, and an aligner estimate well before the tag is almost always the
+# aligner grabbing an earlier phrase.
+RETIME_DEADBAND = 0.15
+# Per-line re-timing only happens when the song as a whole looks early
+# (median shift at least this much); a few late-heard lines in an otherwise
+# accurate file are aligner noise, not tag errors.
+RETIME_GATE = 0.15
+# When nearly every line is off by the same amount the lyric file was timed to
+# a different edit of the song: shift the whole file by that amount instead.
+GLOBAL_OFFSET_MAX_SPREAD = 0.3     # interquartile range of per-line shifts
+GLOBAL_OFFSET_MIN_LINES = 6
+MAX_GLOBAL_OFFSET = 10.0
 # Audio included after the next line's timestamp so ad-libs that overlap the
 # next line can still be placed where they are sung.
 TAIL_PAD = 0.5
@@ -226,6 +317,13 @@ def map_aligned_words_to_tokens(
     return times
 
 
+def alignment_is_poor(times: Sequence[Optional[float]]) -> bool:
+    """True when fewer than half the words got a usable time from the aligner."""
+    n = len(times)
+    known = sum(1 for t in times if t is not None)
+    return known < max(1, (n + 1) // 2)
+
+
 def fallback_word_times(n_tokens: int, line_start: float, line_end: Optional[float]) -> List[float]:
     """Spread words evenly when the aligner could not place them."""
     if n_tokens == 0:
@@ -247,9 +345,8 @@ def finalize_word_times(
     if n == 0:
         return [], False
 
-    known = [t for t in times if t is not None]
     # Too little usable information: the aligner did not really place this line.
-    if len(known) < max(1, (n + 1) // 2):
+    if alignment_is_poor(times):
         return fallback_word_times(n, line_start, line_end), True
 
     out: List[float] = [0.0] * n
@@ -349,6 +446,79 @@ class ConvertStats:
     lines_aligned: int = 0
     lines_fallback: int = 0
     lines_kept: int = 0
+    lines_retimed: int = 0
+    # Whole-file shift applied because the lyrics were timed to a different
+    # edit of the song (0 when not needed).
+    global_offset: float = 0.0
+    # (original tag, raw aligned first-word time) for lines that had context;
+    # kept for diagnostics and tuning.
+    first_word_estimates: List[Tuple[float, float]] = field(default_factory=list)
+    # Mean aligner word probability per aligned line.
+    line_confidences: List[float] = field(default_factory=list)
+
+    @property
+    def confidence(self) -> Optional[float]:
+        if not self.line_confidences:
+            return None
+        return sum(self.line_confidences) / len(self.line_confidences)
+
+
+def decide_retiming(estimates: Sequence[Tuple[float, float]]) -> Tuple[str, float]:
+    """Look at every line's aligned first word and decide what to do.
+
+    Returns ("global", offset) when the whole file is consistently offset from
+    the audio, ("per_line", median) when the file runs early but unevenly, and
+    ("none", 0.0) when the tags already match the vocals.
+    """
+    shifts = sorted(e - FIRST_WORD_BIAS - t for t, e in estimates)
+    if not shifts:
+        return "none", 0.0
+    n = len(shifts)
+    median = shifts[n // 2] if n % 2 else (shifts[n // 2 - 1] + shifts[n // 2]) / 2
+    if n >= GLOBAL_OFFSET_MIN_LINES:
+        q1, q3 = shifts[n // 4], shifts[(3 * n) // 4]
+        if q3 - q1 <= GLOBAL_OFFSET_MAX_SPREAD and RETIME_DEADBAND <= abs(median) <= MAX_GLOBAL_OFFSET:
+            return "global", median
+    if median >= RETIME_GATE:
+        return "per_line", median
+    return "none", 0.0
+
+
+def shift_line(line: LrcLine, offset: float, decimals: int) -> LrcLine:
+    """Move a timed line (and any word tags inside it) by ``offset`` seconds."""
+    if line.start is None:
+        return line
+    new_start = max(0.0, line.start + offset)
+    new_tag = f"[{format_timestamp(new_start, decimals)}]"
+    text = WORD_TS_RE.sub(
+        lambda m: f"<{format_timestamp(max(0.0, parse_timestamp(m.group(1), m.group(2), m.group(3)) + offset), decimals)}>",
+        line.text)
+    raw = new_tag + ("" if line.has_word_tags or not text else " ") + text
+    return LrcLine(raw=raw, start=new_start, tag=new_tag, text=text, has_word_tags=line.has_word_tags)
+
+
+def next_line_start(lines: Sequence[LrcLine], start: float) -> Optional[float]:
+    """Timestamp of the first timed line after ``start`` (any kind of line)."""
+    later = [ln.start for ln in lines if ln.start is not None and ln.start > start]
+    return min(later) if later else None
+
+
+def retimed_line_start(first_word: Optional[float], tag_start: float, next_start: Optional[float]) -> float:
+    """Move a line tag to where its first word is sung, within safe bounds.
+
+    Lyric files are often tagged a few tenths of a second before the vocal
+    actually starts, so the player flips to the line too early.  The shift is
+    bounded so a bad alignment cannot drag a line far from its original place,
+    and the tag never reaches the next line's tag.
+    """
+    if first_word is None:
+        return tag_start
+    if first_word - tag_start < RETIME_DEADBAND:
+        return tag_start
+    new_start = min(first_word, tag_start + MAX_LATE_SHIFT)
+    if next_start is not None:
+        new_start = min(new_start, next_start - MAX_EARLY_SHIFT - MIN_WORD_STEP)
+    return max(new_start, tag_start - MAX_EARLY_SHIFT, 0.0)
 
 
 def line_windows(lines: Sequence[LrcLine], audio_duration: Optional[float]) -> Dict[int, Tuple[float, float]]:
@@ -376,39 +546,163 @@ def line_windows(lines: Sequence[LrcLine], audio_duration: Optional[float]) -> D
     return windows
 
 
+@dataclass
+class Context:
+    slice_start: float
+    slice_end: float
+    text: str
+    tokens: List[str]
+    first_token: int      # index in ``tokens`` where the line being aligned starts
+    has_prev: bool
+
+
+def clean_text(line: LrcLine) -> str:
+    return WORD_TS_RE.sub("", line.text).strip()
+
+
+def build_context(lines: Sequence[LrcLine], idx: int, window_end: float,
+                  audio_duration: Optional[float]) -> Context:
+    """Choose the audio slice and text used to align line ``idx``.
+
+    Whisper pulls the first word of a slice to the slice start and the last
+    word towards its end, so the neighbouring lyric lines are aligned in the
+    same call whenever they are close: the line then sits in the middle of the
+    slice with real words on both sides of it.
+    """
+    line = lines[idx]
+    start = float(line.start)
+    lyric = sorted((ln.start, i) for i, ln in enumerate(lines) if ln.is_lyric)
+    pos = next(k for k, (_, i) in enumerate(lyric) if i == idx)
+
+    prev_i = lyric[pos - 1][1] if pos > 0 else None
+    if prev_i is not None and start - lines[prev_i].start > CONTEXT_GAP:
+        prev_i = None
+    next_i = lyric[pos + 1][1] if pos + 1 < len(lyric) else None
+    if next_i is not None and lines[next_i].start - start > CONTEXT_GAP:
+        next_i = None
+    after_i = lyric[pos + 2][1] if next_i is not None and pos + 2 < len(lyric) else None
+
+    def slice_bounds(with_prev: bool, with_next: bool) -> Tuple[float, float]:
+        s = lines[prev_i].start - LEAD_PAD if with_prev else start - LEAD_PAD_SOLO
+        if with_next:
+            ns = lines[next_i].start
+            e = ns + CONTEXT_TAIL
+            if after_i is not None:
+                e = min(e, lines[after_i].start)
+            e = max(e, ns + TAIL_PAD)
+        else:
+            # No next line close by: run up to the next tag (a slow ballad line
+            # can take ten seconds), but never more than SOLO_TAIL_MAX.
+            e = min(window_end + TAIL_PAD, start + SOLO_TAIL_MAX)
+        return max(0.0, s), e
+
+    s, e = slice_bounds(prev_i is not None, next_i is not None)
+    if e - s > MAX_LINE_WINDOW and next_i is not None:
+        next_i = None
+        s, e = slice_bounds(prev_i is not None, False)
+    if e - s > MAX_LINE_WINDOW and prev_i is not None:
+        prev_i = None
+        s, e = slice_bounds(False, False)
+    e = min(e, s + MAX_LINE_WINDOW)
+    if audio_duration is not None:
+        e = min(e, max(audio_duration, s + MIN_WORD_STEP * 2))
+
+    parts: List[str] = []
+    prev_tokens = 0
+    if prev_i is not None:
+        parts.append(clean_text(lines[prev_i]))
+        prev_tokens = len(tokenize(parts[-1]))
+    parts.append(line.text)
+    if next_i is not None:
+        parts.append(clean_text(lines[next_i]))
+    tokens = [t for p in parts for t in tokenize(p)]
+    return Context(s, e, "\n".join(parts), tokens, prev_tokens, prev_i is not None)
+
+
 def convert_lines(
     lines: Sequence[LrcLine],
     align_fn: AlignFn,
     audio_duration: Optional[float] = None,
     decimals: int = 2,
     should_stop: Optional[Callable[[], bool]] = None,
+    retime_lines: bool = True,
+    _allow_global_shift: bool = True,
 ) -> Tuple[List[str], ConvertStats]:
     stats = ConvertStats(lines_total=len(lines))
     windows = line_windows(lines, audio_duration)
+
+    # Pass 1: align every line and decide where its tag should sit.
+    raw_times: Dict[int, List[Optional[float]]] = {}
+    tokens_by_idx: Dict[int, List[str]] = {}
+    first_words: Dict[int, float] = {}
+    eff_start: Dict[int, float] = {idx: ln.start for idx, ln in enumerate(lines) if ln.start is not None}
+    for idx in windows:
+        if should_stop and should_stop():
+            raise InterruptedError("stopped")
+        start, end = windows[idx]
+        ctx = build_context(lines, idx, end, audio_duration)
+        tokens = tokenize(lines[idx].text)
+        try:
+            aligned = align_fn(ctx.slice_start, ctx.slice_end, ctx.text)
+        except Exception:  # noqa: BLE001 - one bad line must not kill the file
+            aligned = []
+        all_times = map_aligned_words_to_tokens(ctx.tokens, aligned)
+        times = all_times[ctx.first_token:ctx.first_token + len(tokens)]
+        raw_times[idx] = times
+        tokens_by_idx[idx] = tokens
+        probs = [float(p) for (_, _, _, p) in aligned if p is not None]
+        if probs:
+            stats.line_confidences.append(sum(probs) / len(probs))
+        # Only trust the first word's time when a previous line was aligned in
+        # front of it: the first word of a slice is always pulled to the slice start.
+        if ctx.has_prev and times and times[0] is not None and not alignment_is_poor(times):
+            stats.first_word_estimates.append((start, times[0]))
+            first_words[idx] = times[0]
+
+    if retime_lines:
+        mode, amount = decide_retiming(stats.first_word_estimates)
+        if mode == "global" and _allow_global_shift:
+            # The whole file is offset: shift every tag and align again so the
+            # audio slices are taken from the right places.
+            shifted = [shift_line(ln, amount, decimals) for ln in lines]
+            output, stats2 = convert_lines(shifted, align_fn, audio_duration, decimals, should_stop,
+                                           retime_lines=True, _allow_global_shift=False)
+            stats2.global_offset = amount
+            return output, stats2
+        if mode in ("global", "per_line"):
+            for idx, first in first_words.items():
+                start = float(lines[idx].start)
+                new_start = retimed_line_start(first - FIRST_WORD_BIAS, start, next_line_start(lines, start))
+                if abs(new_start - start) >= 0.005:
+                    stats.lines_retimed += 1
+                eff_start[idx] = new_start
+
+    # Pass 2: every word must sit between its own (possibly moved) tag and the
+    # next line's tag, otherwise the player flips lines before showing it.
+    ordered = sorted(eff_start.values())
+    pace = song_pace(raw_times.values())
     output: List[str] = []
     for idx, line in enumerate(lines):
         if idx not in windows:
             output.append(line.raw)
             stats.lines_kept += 1
             continue
-        if should_stop and should_stop():
-            raise InterruptedError("stopped")
-        start, end = windows[idx]
-        end += TAIL_PAD
+        start = eff_start[idx]
+        pos = bisect.bisect_right(ordered, start)
+        end = ordered[pos] if pos < len(ordered) else start + MAX_LINE_WINDOW
+        end = min(end, start + MAX_LINE_WINDOW)
         if audio_duration is not None:
-            end = min(end, max(audio_duration, start + MIN_WORD_STEP * 2))
-        tokens = tokenize(line.text)
-        try:
-            aligned = align_fn(max(0.0, start - LEAD_PAD), end, line.text)
-        except Exception:  # noqa: BLE001 - one bad line must not kill the file
-            aligned = []
-        times = map_aligned_words_to_tokens(tokens, aligned)
-        final_times, used_fallback = finalize_word_times(times, start, end)
+            end = min(end, audio_duration)
+        if end <= start + MIN_WORD_STEP:
+            end = start + MIN_WORD_STEP * 2
+        final_times, used_fallback = finalize_word_times(raw_times[idx], start, end)
         if used_fallback:
             stats.lines_fallback += 1
         else:
             stats.lines_aligned += 1
-        output.append(build_word_line(line.tag, tokens, final_times, decimals))
+            final_times = cap_line_span(final_times, pace=pace)
+        tag = line.tag if abs(start - line.start) < 0.005 else f"[{format_timestamp(start, decimals)}]"
+        output.append(build_word_line(tag, tokens_by_idx[idx], final_times, decimals))
     return output, stats
 
 
@@ -605,6 +899,28 @@ class FileResult:
     stats: Optional[ConvertStats] = None
     message: str = ""
 
+    def flags(self) -> List[str]:
+        """Reasons a person should look at this file."""
+        out: List[str] = []
+        if self.status == "failed":
+            out.append(f"failed: {self.message}")
+        elif self.status == "skipped_no_audio":
+            out.append("no matching audio file")
+        elif self.status == "converted" and self.stats:
+            s = self.stats
+            if abs(s.global_offset) >= 0.005:
+                out.append(f"lyrics shifted {s.global_offset:+.2f} s to match the audio "
+                           "(lyric file timed to a different edit of the song?)")
+            aligned = s.lines_aligned + s.lines_fallback
+            if s.lines_fallback and aligned and s.lines_fallback / aligned >= 0.2:
+                out.append(f"{s.lines_fallback} of {aligned} lines could not be aligned and were spaced evenly")
+            elif s.lines_fallback:
+                out.append(f"{s.lines_fallback} line(s) could not be aligned and were spaced evenly")
+            if s.confidence is not None and s.confidence < LOW_CONFIDENCE:
+                out.append(f"low alignment confidence ({s.confidence:.2f}); word timing may be rough "
+                           "(loud or unclear vocals?) - try a larger model")
+        return out
+
 
 @dataclass
 class Summary:
@@ -621,6 +937,41 @@ class Summary:
             f"no lyrics {self.count('skipped_no_lyrics')}, "
             f"failed {self.count('failed')}"
         )
+
+    def flagged(self) -> List[FileResult]:
+        return [r for r in self.results if r.flags()]
+
+
+REPORT_NAME = "lrc_conversion_report.txt"
+
+
+def write_report(summary: Summary, output_dir: Path) -> Path:
+    """Write a plain-text report with the files worth checking listed first."""
+    lines = ["LRC line-to-word conversion report", summary.describe(), ""]
+    flagged = summary.flagged()
+    lines.append(f"FLAGGED ({len(flagged)}) - worth checking by hand:")
+    if not flagged:
+        lines.append("  none")
+    for r in flagged:
+        lines.append(f"  {r.lrc.name}")
+        for f in r.flags():
+            lines.append(f"      - {f}")
+    lines += ["", "ALL FILES:"]
+    for r in summary.results:
+        detail = ""
+        if r.stats:
+            s = r.stats
+            detail = f"  aligned={s.lines_aligned} fallback={s.lines_fallback} retimed={s.lines_retimed}"
+            if s.confidence is not None:
+                detail += f" confidence={s.confidence:.2f}"
+            if abs(s.global_offset) >= 0.005:
+                detail += f" offset={s.global_offset:+.2f}s"
+        audio = f"  audio={r.audio.name}" if r.audio else ""
+        lines.append(f"  {r.status:20s} {r.lrc.name}{audio}{detail}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / REPORT_NAME
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 def output_path_for(lrc: Path, lyrics_dir: Path, output_dir: Path, recursive: bool) -> Path:
@@ -639,6 +990,7 @@ def convert_file(
     output_path: Path,
     language: str = "en",
     should_stop: Optional[Callable[[], bool]] = None,
+    retime_lines: bool = True,
 ) -> FileResult:
     content = read_text(lrc_path)
     lines = parse_lrc(content)
@@ -655,7 +1007,7 @@ def convert_file(
 
     new_lines, stats = convert_lines(
         lines, aligner.make_align_fn(lang), audio_duration=duration,
-        decimals=detect_decimals(lines), should_stop=should_stop,
+        decimals=detect_decimals(lines), should_stop=should_stop, retime_lines=retime_lines,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -679,6 +1031,7 @@ def process_library(
     log: Callable[[str], None] = print,
     progress: Optional[Callable[[int, int], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    retime_lines: bool = True,
 ) -> Summary:
     summary = Summary()
     lrc_files = find_lrc_files(lyrics_dir, recursive)
@@ -720,10 +1073,14 @@ def process_library(
                     log(f"[{i}/{total}] Skip (no matching audio): {lrc.name}")
                 else:
                     log(f"[{i}/{total}] Aligning: {lrc.name}  <-  {audio.name}")
-                    result = convert_file(lrc, audio, aligner, out_path, language, should_stop)
+                    result = convert_file(lrc, audio, aligner, out_path, language, should_stop, retime_lines)
                     s = result.stats
                     if s:
-                        extra = f", {s.lines_fallback} line(s) fell back to even spacing" if s.lines_fallback else ""
+                        extra = f", {s.lines_retimed} line time(s) adjusted" if s.lines_retimed else ""
+                        if abs(s.global_offset) >= 0.005:
+                            extra += f", whole file shifted {s.global_offset:+.2f} s"
+                        if s.lines_fallback:
+                            extra += f", {s.lines_fallback} line(s) fell back to even spacing"
                         log(f"    Saved {out_path.name}: {s.lines_aligned} line(s) aligned{extra}")
         except InterruptedError:
             log("Stopped.")
@@ -734,4 +1091,11 @@ def process_library(
         summary.results.append(result)
         if progress:
             progress(i, total)
+    try:
+        report = write_report(summary, output_dir)
+        log(f"Report written to {report}")
+        if summary.flagged():
+            log(f"{len(summary.flagged())} file(s) flagged for checking, see the report.")
+    except OSError as e:
+        log(f"Could not write report: {e}")
     return summary
