@@ -146,8 +146,9 @@ matching audio are skipped and listed in the log.
   tool changes nothing.
 - A report named `lrc_conversion_report.txt` is written to the output folder
   after each run. It lists the files worth checking by hand first: files
-  that were shifted, lines that could not be aligned, lyric files with no
-  matching audio, and failures. Then it lists every file with what was done.
+  that were shifted, lines that could not be aligned, lines with more
+  words than their time can hold (their spacing is forced, not heard), lyric
+  files with no matching audio, and failures. Then it lists every file with what was done.
 - A line's words are never allowed to spread further than the song's own
   pace justifies, so a held last note before an instrumental break cannot
   drag words into the break. Slow ballads keep their long lines because the
