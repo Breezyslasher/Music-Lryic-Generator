@@ -107,13 +107,21 @@ matching audio are skipped and listed in the log.
   where Whisper tends to misplace them.
 - Line timestamps in lyric files are often a few tenths of a second early, so
   the player flips to the next line while the last word is still being sung.
-  By default the tool moves each line's timestamp to where its first word is
-  actually sung, at most 0.3 s earlier or 0.5 s later than the original.
-  Timestamps that are already within 0.15 s of the vocal are left untouched,
-  so accurately timed files stay as they are. Every word of a line is kept
-  before the next line's timestamp so nothing gets skipped. Untick the option
-  in the GUI or pass `--keep-line-times` to leave line timestamps exactly as
-  they were.
+  When a file as a whole runs early, the tool moves each early line's
+  timestamp later to where its first word is actually sung, by at most
+  0.35 s. Timestamps are never moved earlier, and files whose timestamps
+  already match the vocals are left exactly as they are. Every word of a
+  line is kept before the next line's timestamp so nothing gets skipped.
+  Untick the option in the GUI or pass `--keep-line-times` to leave line
+  timestamps exactly as they were.
+- When a lyric file was timed to a different edit of the song (every line is
+  off by the same amount, common with lyrics from a service and audio from
+  elsewhere), the whole file is shifted by that amount and the file is
+  flagged in the report.
+- A report named `lrc_conversion_report.txt` is written to the output folder
+  after each run. It lists the files worth checking by hand first: files
+  that were shifted, lines that could not be aligned, lyric files with no
+  matching audio, and failures. Then it lists every file with what was done.
 - Measured against a professionally timed word-by-word file, word timings
   land within 0.2 s for about 80% of words and within 0.5 s for 99%, using
   the `base` model.

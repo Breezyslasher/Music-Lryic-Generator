@@ -276,14 +276,41 @@ class ContextTests(unittest.TestCase):
         ctx = la.build_context(self.THREE, 2, 17.0 + la.MAX_LINE_WINDOW, 20.0)
         self.assertEqual(ctx.text, "four five\nsix")
         self.assertEqual(ctx.first_token, 2)
-        self.assertAlmostEqual(ctx.slice_end, 20.0)  # audio ends
+        self.assertAlmostEqual(ctx.slice_end, min(20.0, 17.0 + la.line_span_cap(1) + 1.0))
+        ctx = la.build_context(self.THREE, 2, 17.0 + la.MAX_LINE_WINDOW, 18.0)
+        self.assertAlmostEqual(ctx.slice_end, 18.0)  # audio ends
 
     def test_far_neighbours_are_not_context(self):
         lines = la.parse_lrc("[00:10.00] one\n[00:30.00] two\n[00:50.00] three\n")
         ctx = la.build_context(lines, 1, 50.0, 200.0)
         self.assertEqual(ctx.text, "two")
         self.assertFalse(ctx.has_prev)
-        self.assertAlmostEqual(ctx.slice_end, 30.0 + la.SOLO_TAIL_MAX)
+        self.assertAlmostEqual(ctx.slice_end, 30.0 + la.line_span_cap(1) + 1.0)
+
+    def test_lone_long_line_gets_more_audio(self):
+        lines = la.parse_lrc("[00:10.00] " + " ".join(["w"] * 40) + "\n")
+        ctx = la.build_context(lines, 0, 40.0, 200.0)
+        self.assertAlmostEqual(ctx.slice_end, 10.0 + la.SOLO_TAIL_MAX)
+
+
+class SpanCapTests(unittest.TestCase):
+    def test_reasonable_span_untouched(self):
+        times = [10.0, 10.3, 10.6, 11.2]
+        self.assertEqual(la.cap_line_span(times), times)
+
+    def test_wild_span_is_compressed(self):
+        times = [10.0, 13.3, 16.9, 20.5]
+        capped = la.cap_line_span(times)
+        self.assertEqual(capped[0], 10.0)
+        self.assertAlmostEqual(capped[-1] - capped[0], la.line_span_cap(4))
+        self.assertTrue(capped[0] < capped[1] < capped[2] < capped[3])
+
+    def test_convert_applies_cap(self):
+        lines = la.parse_lrc("[00:10.00] had a bad day\n")
+        out, _ = la.convert_lines(lines, lambda s, e, t: [("had", 10.0, 10.2, .9), ("a", 13.0, 13.2, .9),
+                                                          ("bad", 16.7, 17.0, .9), ("day", 20.3, 21.0, .9)])
+        times = [la.parse_timestamp(*m.groups()) for m in la.WORD_TS_RE.finditer(out[0])]
+        self.assertLessEqual(times[-1] - times[0], la.line_span_cap(4) + 0.01)
 
     def test_word_level_neighbour_is_stripped(self):
         lines = la.parse_lrc(WORD_FILE + "[00:40.00] plain line\n")
@@ -307,15 +334,58 @@ class RetimeTests(unittest.TestCase):
 
     def test_retimed_line_start_bounds(self):
         self.assertEqual(la.retimed_line_start(10.3, 10.0, 14.0), 10.3)
-        self.assertEqual(la.retimed_line_start(9.8, 10.0, 14.0), 9.8)
-        self.assertEqual(la.retimed_line_start(9.0, 10.0, 14.0), 10.0 - la.MAX_EARLY_SHIFT)
         self.assertEqual(la.retimed_line_start(13.0, 10.0, 14.0), 10.0 + la.MAX_LATE_SHIFT)
         self.assertEqual(la.retimed_line_start(None, 10.0, 14.0), 10.0)
         # Small differences are left alone: the original tag is probably right.
         self.assertEqual(la.retimed_line_start(10.1, 10.0, 14.0), 10.0)
-        self.assertEqual(la.retimed_line_start(9.9, 10.0, 14.0), 10.0)
+        # Tags are never moved earlier: an early estimate is aligner noise.
+        self.assertEqual(la.retimed_line_start(9.8, 10.0, 14.0), 10.0)
+        self.assertEqual(la.retimed_line_start(9.0, 10.0, 14.0), 10.0)
         # Never reaches the next line even when the aligner says so.
         self.assertAlmostEqual(la.retimed_line_start(10.9, 10.0, 10.5), 10.5 - la.MAX_EARLY_SHIFT - la.MIN_WORD_STEP)
+
+    def test_decide_retiming(self):
+        B = la.FIRST_WORD_BIAS
+        self.assertEqual(la.decide_retiming([]), ("none", 0.0))
+        # Accurate file: nothing to do.
+        self.assertEqual(la.decide_retiming([(10.0, 10.0 + B), (14.0, 14.05 + B), (17.0, 16.9 + B)])[0], "none")
+        # Early file with uneven per-line error: per-line later-only.
+        mode, amount = la.decide_retiming([(10.0, 10.5 + B), (14.0, 14.2 + B), (17.0, 17.9 + B)])
+        self.assertEqual(mode, "per_line")
+        # A late-heard minority in an accurate file does not open the gate.
+        self.assertEqual(la.decide_retiming([(10.0, 10.0 + B), (14.0, 14.8 + B), (17.0, 17.0 + B)])[0], "none")
+        # Consistent offset across many lines: whole-file shift (either direction).
+        est = [(10.0 * k, 10.0 * k + 0.9 + B) for k in range(1, 9)]
+        mode, amount = la.decide_retiming(est)
+        self.assertEqual(mode, "global")
+        self.assertAlmostEqual(amount, 0.9)
+        est = [(10.0 * k, 10.0 * k - 0.6 + B) for k in range(1, 9)]
+        self.assertEqual(la.decide_retiming(est)[0], "global")
+        # Too few lines for a whole-file decision falls back to per-line.
+        est = [(10.0 * k, 10.0 * k + 0.9 + B) for k in range(1, 4)]
+        self.assertEqual(la.decide_retiming(est)[0], "per_line")
+
+    def test_shift_line(self):
+        ln = la.parse_lrc("[00:10.00] one two\n[00:12.00]\n[00:28.90]<00:28.90>I <00:29.34>got\n[ar:x]\n")
+        s = [la.shift_line(l, 0.9, 2) for l in ln]
+        self.assertEqual(s[0].raw, "[00:10.90] one two")
+        self.assertAlmostEqual(s[0].start, 10.9)
+        self.assertEqual(s[1].raw, "[00:12.90]")
+        self.assertEqual(s[2].raw, "[00:29.80]<00:29.80>I <00:30.24>got")
+        self.assertEqual(s[3].raw, "[ar:x]")
+        self.assertEqual(la.shift_line(ln[0], -20.0, 2).raw, "[00:00.00] one two")
+
+    def test_whole_file_offset_is_applied(self):
+        text = "".join(f"[00:{10 + 4 * k:02d}.00] word{k} more\n" for k in range(8))
+        lines = la.parse_lrc(text)
+        out, stats = la.convert_lines(lines, context_align(lines, 0.9 + la.FIRST_WORD_BIAS))
+        self.assertAlmostEqual(stats.global_offset, 0.9)
+        self.assertTrue(out[0].startswith("[00:10.90]<00:10.90>word0"), out[0])
+        self.assertTrue(out[7].startswith("[00:38.90]<00:38.90>word7"), out[7])
+        # Keep-line-times switches all of this off.
+        out, stats = la.convert_lines(lines, context_align(lines, 0.9 + la.FIRST_WORD_BIAS), retime_lines=False)
+        self.assertEqual(stats.global_offset, 0.0)
+        self.assertTrue(out[0].startswith("[00:10.00]"), out[0])
 
     def test_tag_moves_to_sung_first_word(self):
         # The aligner hears first words FIRST_WORD_BIAS late; that is corrected.
@@ -332,15 +402,16 @@ class RetimeTests(unittest.TestCase):
         self.assertTrue(out[1].startswith("[00:14.00]<00:14.00>four"), out[1])
         self.assertEqual(stats.lines_retimed, 0)
 
-    def test_tag_moves_earlier_within_bound(self):
-        out, _ = self.convert(-0.2 + la.FIRST_WORD_BIAS)
-        self.assertTrue(out[1].startswith("[00:13.80]<00:13.80>four"), out[1])
+    def test_tags_are_never_moved_earlier(self):
+        out, stats = self.convert(-0.2 + la.FIRST_WORD_BIAS)
+        self.assertTrue(out[1].startswith("[00:14.00]<00:14.00>four"), out[1])
+        self.assertEqual(stats.lines_retimed, 0)
         out, _ = self.convert(-0.45 + la.FIRST_WORD_BIAS)
-        self.assertTrue(out[1].startswith("[00:13.70]<00:13.70>four"), out[1])
+        self.assertTrue(out[1].startswith("[00:14.00]<00:14.00>four"), out[1])
 
     def test_late_shift_is_capped(self):
         out, _ = self.convert(2.5)
-        self.assertTrue(out[1].startswith("[00:14.50]<00:14.50>four"), out[1])
+        self.assertTrue(out[1].startswith("[00:14.35]<00:14.35>four"), out[1])
 
     def test_keep_line_times(self):
         out, stats = self.convert(0.3 + la.FIRST_WORD_BIAS, retime_lines=False)
@@ -356,7 +427,7 @@ class RetimeTests(unittest.TestCase):
         # Line 1's words run late; line 2's tag moves 0.3s later. Every word of
         # line 1 must still sit before line 2's new tag.
         when = {"one": 10.0, "two": 13.9, "three": 14.4, "four": 14.3 + la.FIRST_WORD_BIAS, "five": 14.8,
-                "six": 17.0, "seven": 17.4}
+                "six": 17.3 + la.FIRST_WORD_BIAS, "seven": 17.7}
 
         def fn(start, end, text):
             return [(w, when[w], when[w] + 0.2, .9) for w in text.split()]
@@ -451,10 +522,37 @@ class ProcessLibraryTests(unittest.TestCase):
             converted = (out / "Line.lrc").read_text()
             self.assertIn("[00:15.23]<00:15.23>Oh,", converted)
             self.assertTrue(la.is_word_level(la.parse_lrc(converted)))
+            # A report lists the questionable files first.
+            report = (out / la.REPORT_NAME).read_text()
+            self.assertIn("FLAGGED (1)", report)
+            self.assertIn("NoAudio.lrc", report.split("ALL FILES:")[0])
+            self.assertIn("no matching audio file", report)
+            self.assertIn("converted            Line.lrc", report)
             # Running again skips the already converted output.
             summary2 = la.process_library(music, music, out, aligner, log=logs.append)
             self.assertEqual(summary2.count("converted"), 0)
             self.assertEqual(summary2.count("skipped_word_level"), 2)
+
+    def test_flags(self):
+        ok = la.FileResult(Path("a.lrc"), "converted", stats=la.ConvertStats(lines_aligned=10))
+        self.assertEqual(ok.flags(), [])
+        shifted = la.FileResult(Path("a.lrc"), "converted", stats=la.ConvertStats(lines_aligned=10, global_offset=0.9))
+        self.assertIn("+0.90 s", shifted.flags()[0])
+        poor = la.FileResult(Path("a.lrc"), "converted", stats=la.ConvertStats(lines_aligned=5, lines_fallback=5))
+        self.assertIn("5 of 10 lines", poor.flags()[0])
+        self.assertIn("failed: boom", la.FileResult(Path("a.lrc"), "failed", message="boom").flags()[0])
+        self.assertEqual(la.FileResult(Path("a.lrc"), "skipped_word_level").flags(), [])
+        rough = la.FileResult(Path("a.lrc"), "converted",
+                              stats=la.ConvertStats(lines_aligned=10, line_confidences=[0.3, 0.4]))
+        self.assertIn("low alignment confidence (0.35)", rough.flags()[0])
+        fine = la.FileResult(Path("a.lrc"), "converted",
+                             stats=la.ConvertStats(lines_aligned=10, line_confidences=[0.8, 0.9]))
+        self.assertEqual(fine.flags(), [])
+
+    def test_confidence_is_collected(self):
+        lines = la.parse_lrc("[00:10.00] one two\n[00:14.00] three\n")
+        _, stats = la.convert_lines(lines, context_align(lines))
+        self.assertAlmostEqual(stats.confidence, 0.9)
 
     def test_in_place_keeps_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
