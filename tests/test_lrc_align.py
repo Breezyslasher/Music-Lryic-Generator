@@ -703,6 +703,26 @@ class ProcessLibraryTests(unittest.TestCase):
             self.assertEqual(summary.count("converted"), 0)
             self.assertEqual((music / "Mine.lrc").read_bytes(), before)
 
+    def test_only_flagged_from_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            music = Path(tmp)
+            for name in ("A", "B", "C"):
+                (music / f"{name}.mp3").write_bytes(b"")
+                (music / f"{name}.lrc").write_text(LINE_FILE)
+            (music / "D.lrc").write_text(LINE_FILE)          # no audio -> flagged
+            la.process_library(music, music, music, FakeAligner(), log=lambda m: None)
+            report = music / la.REPORT_NAME
+            self.assertEqual(la.flagged_names_from_report(report), ["D.lrc"])
+            # Pretend A was flagged too, then redo only the flagged ones.
+            report.write_text(report.read_text().replace("FLAGGED (1) - worth checking by hand:",
+                                                         "FLAGGED (2) - worth checking by hand:\n  A.lrc\n      - low confidence"))
+            b_before = (music / "B.lrc").read_bytes()
+            summary = la.process_library(music, music, music, FakeAligner(), log=lambda m: None,
+                                         reconvert=True, only=la.flagged_names_from_report(report))
+            self.assertEqual(sorted(r.lrc.name for r in summary.results), ["A.lrc", "D.lrc"])
+            self.assertEqual(summary.count("converted"), 1)
+            self.assertEqual((music / "B.lrc").read_bytes(), b_before)
+
     def test_line_level_source(self):
         src = la.line_level_source("[re:lrc-align 1.0.0 align word]\n[ar:x]\n" + WORD_FILE + "[00:40.00]\n")
         self.assertEqual(src, "[ar:x]\n[00:28.90] I got a feeling\n[00:36.66] That tonight's gonna be\n[00:40.00]\n")

@@ -87,6 +87,20 @@ The first run downloads the Whisper model.
 | `--device cpu|cuda` | force a device (default: auto) |
 | `-r`, `--recursive` | include sub-folders; the folder structure is mirrored in the output |
 | `--reconvert` | also redo files this tool converted before (recognised by their `[re:lrc-align ...]` tag), from the `.lrc.bak` original; word-by-word files from any other source are still left alone. Use after updating the tool. |
+| `--only-flagged [REPORT]` | process only the files listed as flagged in a report from an earlier run (default: the report in the output folder), redoing them from their `.lrc.bak`. Typical use: a second pass over flagged songs with `--model medium.en`. |
+
+### After a run
+
+- Files that **failed** (a decode error, a network hiccup) were not written, so
+  they are still line-level: run the same command again and only they get
+  converted.
+- Files **flagged** in the report can be redone with a bigger model without
+  touching the rest:
+
+      python Lryics.py --audio "D:/Music" --recursive --only-flagged --model medium.en
+
+  That run writes its own `lrc_conversion_report_rerun.txt`, leaving the
+  full report from the main run in place.
 
 ### Matching lyrics to audio
 
