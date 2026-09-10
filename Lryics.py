@@ -38,13 +38,26 @@ def run_cli(args: argparse.Namespace) -> int:
         print(f"Lyrics folder not found: {lyrics_dir}", file=sys.stderr)
         return 2
 
+    only = None
+    reconvert = args.reconvert
+    if args.only_flagged is not None:
+        report = Path(args.only_flagged) if args.only_flagged else output_dir / lrc_align.REPORT_NAME
+        if not report.is_file():
+            print(f"Report not found: {report}", file=sys.stderr)
+            return 2
+        only = lrc_align.flagged_names_from_report(report)
+        reconvert = True
+        print(f"{len(only)} flagged file(s) listed in {report.name}")
+        if not only:
+            return 0
+
     print(f"Loading Whisper model '{args.model}'...")
     aligner = lrc_align.WhisperLineAligner(args.model, device=args.device)
     print(f"Model loaded on {aligner.device}.")
     summary = lrc_align.process_library(
         audio_dir, lyrics_dir, output_dir, aligner,
         language=args.language, recursive=args.recursive, log=print,
-        retime_lines=not args.keep_line_times, reconvert=args.reconvert,
+        retime_lines=not args.keep_line_times, reconvert=reconvert, only=only,
     )
     print("Done: " + summary.describe())
     return 0 if summary.count("failed") == 0 else 1
@@ -63,6 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reconvert", action="store_true",
                    help="Also redo files this tool converted before (from their .lrc.bak); "
                         "word-by-word files from other sources are still left alone")
+    p.add_argument("--only-flagged", metavar="REPORT", nargs="?", const="",
+                   help="Only process the files listed as flagged in a report from an earlier run "
+                        "(default: the report in the output folder). Implies --reconvert.")
     p.add_argument("--keep-line-times", action="store_true",
                    help="Keep the original line timestamps instead of moving them to the sung first word")
     return p

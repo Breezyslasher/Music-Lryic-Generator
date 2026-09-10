@@ -992,9 +992,26 @@ class Summary:
 
 
 REPORT_NAME = "lrc_conversion_report.txt"
+# A run limited to chosen files writes here so the full report survives.
+RERUN_REPORT_NAME = "lrc_conversion_report_rerun.txt"
 
 
-def write_report(summary: Summary, output_dir: Path) -> Path:
+def flagged_names_from_report(report_path: Path) -> List[str]:
+    """File names listed in the FLAGGED section of a report written by this tool."""
+    names: List[str] = []
+    in_flagged = False
+    for line in read_text(report_path).splitlines():
+        if line.startswith("FLAGGED"):
+            in_flagged = True
+            continue
+        if line.startswith("ALL FILES"):
+            break
+        if in_flagged and line.startswith("  ") and not line.startswith("      -") and line.strip() != "none":
+            names.append(line.strip())
+    return names
+
+
+def write_report(summary: Summary, output_dir: Path, name: str = REPORT_NAME) -> Path:
     """Write a plain-text report with the files worth checking listed first."""
     lines = ["LRC line-to-word conversion report", summary.describe(), ""]
     flagged = summary.flagged()
@@ -1018,7 +1035,7 @@ def write_report(summary: Summary, output_dir: Path) -> Path:
         audio = f"  audio={r.audio.name}" if r.audio else ""
         lines.append(f"  {r.status:20s} {r.lrc.name}{audio}{detail}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / REPORT_NAME
+    path = output_dir / name
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
 
@@ -1151,6 +1168,7 @@ def process_library(
     should_stop: Optional[Callable[[], bool]] = None,
     retime_lines: bool = True,
     reconvert: bool = False,
+    only: Optional[Iterable[str]] = None,
 ) -> Summary:
     """Convert every line-level .lrc under ``lyrics_dir``.
 
@@ -1158,9 +1176,17 @@ def process_library(
     their ``[re:lrc-align ...]`` tag) are done again from the ``.lrc.bak``
     original where one exists, otherwise from the file with its word tags
     stripped.  Word-by-word files written by anything else are never touched.
+    ``only`` limits the run to lyric files with those names (for example the
+    flagged names from an earlier report); other files are not even listed.
     """
     summary = Summary()
     lrc_files = find_lrc_files(lyrics_dir, recursive)
+    if only is not None:
+        wanted = {n.strip() for n in only}
+        lrc_files = [f for f in lrc_files if f.name in wanted]
+        missing = wanted - {f.name for f in lrc_files}
+        for name in sorted(missing):
+            log(f"Not found in the lyrics folder: {name}")
     if not lrc_files:
         log("No .lrc files found in the lyrics folder.")
         return summary
@@ -1226,7 +1252,7 @@ def process_library(
         if progress:
             progress(i, total)
     try:
-        report = write_report(summary, output_dir)
+        report = write_report(summary, output_dir, REPORT_NAME if only is None else RERUN_REPORT_NAME)
         log(f"Report written to {report}")
         if summary.flagged():
             log(f"{len(summary.flagged())} file(s) flagged for checking, see the report.")
