@@ -519,6 +519,89 @@ class RetimeTests(unittest.TestCase):
         self.assertTrue(starts[0] < starts[1] < starts[2], starts)
 
 
+class DistinctTagTests(unittest.TestCase):
+    """No two adjacent printed word tags may ever be equal (Beetdrop and
+    players skip a word that shares its timestamp with the previous one)."""
+
+    @staticmethod
+    def printed_tags(line):
+        return [m.group(0) for m in la.WORD_TS_RE.finditer(line)]
+
+    def assert_distinct(self, out_lines):
+        for line in out_lines:
+            tags = self.printed_tags(line)
+            for a, b in zip(tags, tags[1:]):
+                self.assertNotEqual(a, b, line)
+            # ...and strictly increasing as values too
+            vals = [la.parse_timestamp(*m.groups()) for m in la.WORD_TS_RE.finditer(line)]
+            self.assertTrue(all(x < y for x, y in zip(vals, vals[1:])), line)
+
+    def test_enforce_increasing(self):
+        out, forced = la.enforce_increasing([1.0, 1.0, 1.005, 2.0], 0.015)
+        self.assertTrue(forced)
+        self.assertEqual([round(t, 3) for t in out], [1.0, 1.015, 1.03, 2.0])
+        out, forced = la.enforce_increasing([1.0, 1.5, 2.0], 0.015)
+        self.assertFalse(forced)
+        self.assertEqual(out, [1.0, 1.5, 2.0])
+
+    def test_compression_after_finalize_keeps_tags_distinct(self):
+        # Regression: finalize spaces words by the minimum step, then the span
+        # cap scales the line down and used to collapse those gaps to zero.
+        text = "".join(f"[00:{10 + 3 * k:02d}.00] w{k}a w{k}b w{k}c\n" for k in range(6))
+        text += "[00:28.00] " + " ".join(f"t{i}" for i in range(14)) + "\n[00:29.50] next line\n"
+        lines = la.parse_lrc(text)
+        base = context_align(lines, words_per_second=3.0)
+
+        def fn(start, end, txt):
+            words = base(start, end, txt)
+            # The long line: words packed at exactly the minimum step, then far apart
+            out = []
+            for w, s_, e_, p in words:
+                if w.startswith("t"):
+                    i = int(w[1:])
+                    s_ = 28.0 + (i * la.MIN_WORD_STEP if i < 10 else 20.0 + i)
+                    e_ = s_ + 0.01
+                out.append((w, s_, e_, p))
+            return out
+        out, stats = la.convert_lines(lines, fn, audio_duration=200.0)
+        self.assert_distinct(out)
+        self.assertGreaterEqual(stats.lines_forced, 1)
+
+    def test_fourteen_words_in_a_short_window(self):
+        # 14 words with only 0.1 s before the next line: 7 ms apart is below
+        # what two decimals can print, so the spacing must be forced.
+        lines = la.parse_lrc("[00:10.00] " + " ".join(f"w{i}" for i in range(14)) + "\n[00:10.10] next\n")
+        out, stats = la.convert_lines(lines, lambda s, e, t: [(w, 10.0, 10.0, .9) for w in t.split()])
+        self.assert_distinct(out)
+        self.assertEqual(stats.lines_forced, 1)
+        # With 0.3 s available the same words can be spaced honestly (21 ms).
+        lines = la.parse_lrc("[00:10.00] " + " ".join(f"w{i}" for i in range(14)) + "\n[00:10.30] next\n")
+        out, stats = la.convert_lines(lines, lambda s, e, t: [(w, 10.0, 10.0, .9) for w in t.split()])
+        self.assert_distinct(out)
+        self.assertEqual(stats.lines_forced, 0)
+
+    def test_distinct_with_three_decimals(self):
+        lines = la.parse_lrc("[00:10.000] " + " ".join(f"w{i}" for i in range(14)) + "\n[00:10.010] next\n")
+        out, stats = la.convert_lines(lines, lambda s, e, t: [(w, 10.0, 10.0, .9) for w in t.split()],
+                                      decimals=la.detect_decimals(lines))
+        self.assert_distinct(out)
+        self.assertIn("<00:10.001>", out[0])          # step derived from decimals (1.5 ms), not 0.01
+        self.assertEqual(stats.lines_forced, 1)
+
+    def test_well_behaved_file_is_unchanged(self):
+        lines = la.parse_lrc(LINE_FILE)
+        out, stats = la.convert_lines(lines, context_align(lines), audio_duration=200.0)
+        self.assertEqual(out[1], "[00:15.23]<00:15.23>Oh, <00:15.73>oh, <00:16.23>oh <00:16.73>oh <00:17.23>oh")
+        self.assertEqual(stats.lines_forced, 0)
+        self.assert_distinct(out)
+
+    def test_forced_lines_are_flagged_when_common(self):
+        few = la.FileResult(Path("a.lrc"), "converted", stats=la.ConvertStats(lines_aligned=40, lines_forced=1))
+        self.assertEqual(few.flags(), [])
+        many = la.FileResult(Path("a.lrc"), "converted", stats=la.ConvertStats(lines_aligned=40, lines_forced=3))
+        self.assertIn("forced", many.flags()[0])
+
+
 class FileMatchingTests(unittest.TestCase):
     def test_normalize_stem(self):
         self.assertEqual(la.normalize_stem("Gangsta#U2019s Paradise"), "gangsta’s paradise")

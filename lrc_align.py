@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # Name written into the ``[re:...]`` provenance tag of every converted file.
 WRITER = "lrc-align"
@@ -452,6 +452,33 @@ def spread_ties(values: Sequence[float], line_start: float, line_end: Optional[f
     return out
 
 
+def min_printed_step(decimals: int) -> float:
+    """Smallest gap that is guaranteed to print as two different timestamps.
+
+    ``format_timestamp`` truncates, so a gap equal to one printed quantum can
+    print as one value or two depending on floating point; one and a half
+    quanta always prints as two.
+    """
+    return 1.5 / (10 ** decimals)
+
+
+def enforce_increasing(times: Sequence[float], step: float) -> Tuple[List[float], bool]:
+    """Make word times strictly increasing by at least ``step``.
+
+    This is the last pass before formatting, so it is the one that guarantees
+    no two adjacent printed tags are equal.  Returns (times, forced) where
+    ``forced`` says some gap had to be widened, i.e. the line has more words
+    than its time can honestly hold.
+    """
+    out = list(times)
+    forced = False
+    for k in range(1, len(out)):
+        if out[k] < out[k - 1] + step:
+            out[k] = out[k - 1] + step
+            forced = True
+    return out, forced
+
+
 def build_word_line(tag: str, tokens: Sequence[str], times: Sequence[float], decimals: int = 2) -> str:
     parts = [f"<{format_timestamp(t, decimals)}>{tok}" for tok, t in zip(tokens, times)]
     return f"{tag}{' '.join(parts)}"
@@ -467,6 +494,10 @@ class ConvertStats:
     lines_fallback: int = 0
     lines_kept: int = 0
     lines_retimed: int = 0
+    # Lines whose words had to be pushed apart to the minimum printed step
+    # because the line has more words than its time can hold (their timing
+    # is evenly forced, not heard).
+    lines_forced: int = 0
     # Whole-file shift applied because the lyrics were timed to a different
     # edit of the song (0 when not needed).
     global_offset: float = 0.0
@@ -761,6 +792,11 @@ def convert_lines(
         else:
             stats.lines_aligned += 1
             final_times = cap_line_span(final_times, pace=pace)
+        # Every transformation above may squeeze words together; the pass that
+        # feeds the formatter is the one that must guarantee distinct tags.
+        final_times, forced = enforce_increasing(final_times, min_printed_step(decimals))
+        if forced:
+            stats.lines_forced += 1
         tag = line.tag if abs(start - line.start) < 0.005 else f"[{format_timestamp(start, decimals)}]"
         output.append(build_word_line(tag, tokens_by_idx[idx], final_times, decimals))
     return output, stats
@@ -976,6 +1012,9 @@ class FileResult:
                 out.append(f"{s.lines_fallback} of {aligned} lines could not be aligned and were spaced evenly")
             elif s.lines_fallback:
                 out.append(f"{s.lines_fallback} line(s) could not be aligned and were spaced evenly")
+            if s.lines_forced and aligned and (s.lines_forced >= 3 or s.lines_forced / aligned >= 0.1):
+                out.append(f"{s.lines_forced} line(s) have more words than their time can hold; "
+                           "their word spacing was forced, not heard")
             if s.confidence is not None and s.confidence < LOW_CONFIDENCE:
                 out.append(f"low alignment confidence ({s.confidence:.2f}); word timing may be rough "
                            "(loud or unclear vocals?) - try a larger model")
@@ -1038,7 +1077,8 @@ def write_report(summary: Summary, output_dir: Path, name: str = REPORT_NAME) ->
         detail = ""
         if r.stats:
             s = r.stats
-            detail = f"  aligned={s.lines_aligned} fallback={s.lines_fallback} retimed={s.lines_retimed}"
+            detail = (f"  aligned={s.lines_aligned} fallback={s.lines_fallback} retimed={s.lines_retimed}"
+                      f" forced={s.lines_forced}")
             if s.confidence is not None:
                 detail += f" confidence={s.confidence:.2f}"
             if abs(s.global_offset) >= 0.005:
@@ -1252,6 +1292,8 @@ def process_library(
                             extra += f", whole file shifted {s.global_offset:+.2f} s"
                         if s.lines_fallback:
                             extra += f", {s.lines_fallback} line(s) fell back to even spacing"
+                        if s.lines_forced:
+                            extra += f", {s.lines_forced} line(s) with forced word spacing"
                         log(f"    Saved {out_path.name}: {s.lines_aligned} line(s) aligned{extra}")
         except InterruptedError:
             log("Stopped.")
