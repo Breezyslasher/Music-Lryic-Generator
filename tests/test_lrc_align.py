@@ -483,14 +483,27 @@ class RetimeTests(unittest.TestCase):
         self.assertGreaterEqual(stats.lines_retimed, 1)
 
     def test_true_overlap_does_not_move_tag(self):
-        # Line B really starts before A's last word: nothing to gain by moving B.
-        when = {"one": 10.0, "two": 12.0, "three": 14.3, "four": 14.1, "five": 14.6,
+        # Line B really starts well before A's last word: B's tag stays put and
+        # A's tail is packed before it.
+        when = {"one": 10.0, "two": 12.0, "three": 14.6, "four": 14.1, "five": 14.6,
                 "six": 17.0, "seven": 17.4}
 
         def fn(start, end, text):
             return [(w, when[w], when[w] + 0.2, .9) for w in text.split()]
         out, _ = la.convert_lines(la.parse_lrc(self.TEXT), fn)
         self.assertTrue(out[1].startswith("[00:14.00]"), out[1])
+
+    def test_back_to_back_lines_keep_last_word_readable(self):
+        # A ends at 13.99 and B starts at 14.02: B's tag moves so A's last word
+        # is shown for MIN_LAST_WORD_SHOW rather than a hundredth of a second.
+        when = {"one": 10.0, "two": 12.0, "three": 13.99, "four": 14.02 + la.FIRST_WORD_BIAS, "five": 14.5,
+                "six": 17.0, "seven": 17.4}
+
+        def fn(start, end, text):
+            return [(w, when[w], when[w] + 0.2, .9) for w in text.split()]
+        out, _ = la.convert_lines(la.parse_lrc(self.TEXT), fn)
+        tag_b = la.parse_timestamp(*la.LINE_TS_RE.match(out[1]).groups())
+        self.assertAlmostEqual(tag_b, 13.99 + la.MIN_LAST_WORD_SHOW, places=2)
 
     def test_tail_room_is_capped(self):
         raw = {0: [10.0, 15.5], 1: [16.9, 17.2], 2: [30.0, 30.4]}

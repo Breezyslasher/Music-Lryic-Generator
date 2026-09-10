@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Name written into the ``[re:...]`` provenance tag of every converted file.
 WRITER = "lrc-align"
@@ -150,6 +150,10 @@ MAX_GLOBAL_OFFSET = 10.0
 TAIL_ROOM = 0.15
 TAIL_ROOM_TRIGGER = 0.05
 MAX_TAIL_SHIFT = 0.6
+# Even when two lines are sung back to back, the last word of a line must be
+# shown for at least this long: a word displayed for a hundredth of a second
+# cannot be read, while a line flipping this much late is not noticeable.
+MIN_LAST_WORD_SHOW = 0.12
 # Audio included after the next line's timestamp so ad-libs that overlap the
 # next line can still be placed where they are sung.
 TAIL_PAD = 0.5
@@ -539,10 +543,17 @@ def make_room_for_tails(lines: Sequence[LrcLine], raw_times: Dict[int, List[Opti
             continue
         tag_b = eff_start[b]
         first_b -= FIRST_WORD_BIAS
-        if last_a < tag_b - TAIL_ROOM_TRIGGER or first_b <= last_a + TAIL_ROOM:
-            continue
-        new = min(last_a + TAIL_ROOM, first_b, float(lines[b].start) + MAX_TAIL_SHIFT)
         after = next_line_start(lines, float(lines[b].start))
+        if last_a >= tag_b - TAIL_ROOM_TRIGGER and first_b > last_a + TAIL_ROOM:
+            # B's tag is early: A's tail is sung before B's first word.
+            new = min(last_a + TAIL_ROOM, first_b, float(lines[b].start) + MAX_TAIL_SHIFT)
+        elif first_b >= last_a and tag_b - last_a < MIN_LAST_WORD_SHOW:
+            # Sung back to back: still give A's last word a readable moment,
+            # at the cost of B appearing at most that much late.
+            new = min(last_a + MIN_LAST_WORD_SHOW, first_b + MIN_LAST_WORD_SHOW,
+                      float(lines[b].start) + MAX_TAIL_SHIFT)
+        else:
+            continue
         if after is not None:
             new = min(new, after - MIN_WORD_STEP * 2)
         if new > tag_b + 0.005:
