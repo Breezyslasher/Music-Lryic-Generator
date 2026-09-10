@@ -392,6 +392,24 @@ class RetimeTests(unittest.TestCase):
         est = [(10.0 * k, 10.0 * k + 0.9 + B) for k in range(1, 4)]
         self.assertEqual(la.decide_retiming(est)[0], "per_line")
 
+    def test_badly_early_file_is_shifted_by_the_agreed_amount(self):
+        B = la.FIRST_WORD_BIAS
+        # Every line early, by 0.9 to 3 s: not a constant offset, but three
+        # quarters agree on at least 0.9 s -> shift by that, per-line does the rest.
+        early = [0.9, 1.0, 1.4, 1.5, 2.0, 2.3, 2.5, 3.0]
+        est = [(10.0 * k, 10.0 * k + d + B) for k, d in enumerate(early, 1)]
+        mode, amount = la.decide_retiming(est)
+        self.assertEqual(mode, "global")
+        self.assertAlmostEqual(amount, 1.4)          # lower quartile: 6 of 8 lines are at least this early
+        # A file that is only mildly early stays per-line.
+        mild = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+        est = [(10.0 * k, 10.0 * k + d + B) for k, d in enumerate(mild, 1)]
+        self.assertEqual(la.decide_retiming(est)[0], "per_line")
+        # Half the lines early and half accurate: no agreed amount, per-line only.
+        mixed = [0.0, 0.05, 0.0, 0.1, 1.5, 2.0, 2.5, 3.0]
+        est = [(10.0 * k, 10.0 * k + d + B) for k, d in enumerate(mixed, 1)]
+        self.assertEqual(la.decide_retiming(est)[0], "per_line")
+
     def test_shift_line(self):
         ln = la.parse_lrc("[00:10.00] one two\n[00:12.00]\n[00:28.90]<00:28.90>I <00:29.34>got\n[ar:x]\n")
         s = [la.shift_line(l, 0.9, 2) for l in ln]

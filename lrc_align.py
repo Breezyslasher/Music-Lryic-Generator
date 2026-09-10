@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # Name written into the ``[re:...]`` provenance tag of every converted file.
 WRITER = "lrc-align"
@@ -171,6 +171,14 @@ RETIME_GATE = 0.15
 GLOBAL_OFFSET_MAX_SPREAD = 0.3     # interquartile range of per-line shifts
 GLOBAL_OFFSET_MIN_LINES = 6
 MAX_GLOBAL_OFFSET = 10.0
+# A file can also be early by a lot without being off by a constant amount
+# (sloppy timing rather than a different edit).  When the median shift is at
+# least PARTIAL_SHIFT_MEDIAN and three quarters of the lines are at least
+# PARTIAL_SHIFT_MIN early, the whole file is shifted by that agreed amount
+# (the lower quartile) and re-aligned; the per-line rule then finishes the
+# job within its cap.  Accurate files have a lower quartile near zero.
+PARTIAL_SHIFT_MEDIAN = 0.6
+PARTIAL_SHIFT_MIN = 0.3
 # Room for the previous line's tail.  When a line's last aligned word lands at
 # or after the next line's tag while the next line's own first word is heard
 # later still, that tag is early and the last word would be shown for an
@@ -702,6 +710,8 @@ def decide_retiming(estimates: Sequence[Tuple[float, float]]) -> Tuple[str, floa
         q1, q3 = shifts[n // 4], shifts[(3 * n) // 4]
         if q3 - q1 <= GLOBAL_OFFSET_MAX_SPREAD and RETIME_DEADBAND <= abs(median) <= MAX_GLOBAL_OFFSET:
             return "global", median
+        if median >= PARTIAL_SHIFT_MEDIAN and PARTIAL_SHIFT_MIN <= q1 <= MAX_GLOBAL_OFFSET:
+            return "global", q1
     if median >= RETIME_GATE:
         return "per_line", median
     return "none", 0.0
