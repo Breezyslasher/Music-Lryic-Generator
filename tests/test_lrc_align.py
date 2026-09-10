@@ -610,6 +610,112 @@ class DistinctTagTests(unittest.TestCase):
         self.assertIn("forced", many.flags()[0])
 
 
+class LibraryRunFixesTests(unittest.TestCase):
+    """Fixes from the first full-library run (3,128 files)."""
+
+    def test_tag_is_never_moved_earlier_by_the_next_line_bound(self):
+        # Lines 0.2 s apart: the "never reach the next line" bound used to pull
+        # the tag 0.11 s EARLIER than it was.
+        self.assertEqual(la.retimed_line_start(55.3, 54.67, 54.87), 54.67)
+        self.assertGreaterEqual(la.retimed_line_start(11.0, 10.0, 10.2), 10.0)
+
+    def test_shared_tags_are_left_alone(self):
+        # Two lines on one timestamp (a duet, a translation): moving one and
+        # not the other put them out of order.
+        text = "[00:10.00] one two\n[00:14.00] four five\n[00:14.00] cuatro cinco\n[00:18.00] six seven\n"
+        lines = la.parse_lrc(text)
+        self.assertEqual(la.shared_tags(lines), {14.0})
+        out, _ = la.convert_lines(lines, context_align(lines, 0.4 + la.FIRST_WORD_BIAS))
+        starts = [la.parse_timestamp(*la.LINE_TS_RE.match(l).groups()) for l in out]
+        self.assertEqual(starts[1], 14.0)
+        self.assertEqual(starts[2], 14.0)
+        self.assertTrue(all(a <= b for a, b in zip(starts, starts[1:])), starts)
+        self.assertEqual(starts[3], 18.4)          # unshared lines still re-time
+
+    def test_near_ties_are_spread_like_ties(self):
+        self.assertEqual(la.merge_near_ties([10.0, 10.5, 10.51, 10.52, 11.5]), [10.0, 10.5, 10.5, 10.5, 11.5])
+        # anchored to the group's first word, so a run of close words does not chain forever
+        self.assertEqual(la.merge_near_ties([1.0, 1.04, 1.08, 1.12]), [1.0, 1.0, 1.08, 1.08])
+        times, forced = la.finalize_word_times([10.0, 10.5, 10.51, 10.52, 11.5], 10.0, 12.0)
+        self.assertEqual([round(t, 3) for t in times], [10.0, 10.5, 10.833, 11.167, 11.5])
+        # "Oh, oh, oh oh oh" with the last three heard at one instant
+        lines = la.parse_lrc("[00:18.59] Oh, oh, oh oh oh\n[00:22.86] next\n")
+        when = [18.59, 19.96, 22.46, 22.47, 22.49]
+        out, stats = la.convert_lines(lines, lambda s, e, t: [(w, when[i], when[i] + .1, .9) if i < 5 else (w, 22.9, 23.0, .9)
+                                                              for i, w in enumerate(t.split())])
+        vals = [la.parse_timestamp(*m.groups()) for m in la.WORD_TS_RE.finditer(out[0])]
+        self.assertTrue(all(b - a > 0.1 for a, b in zip(vals, vals[1:])), vals)
+        self.assertEqual(stats.lines_forced, 0)
+
+    def test_fit_before_keeps_line_inside_window(self):
+        times = [10.0, 11.9, 11.915, 11.93, 11.945]      # cluster pushed past the next tag at 11.92
+        fitted = la.fit_before(times, 11.92 - 0.015, 0.015)
+        self.assertLessEqual(fitted[-1], 11.905 + 1e-9)
+        self.assertTrue(all(b - a >= 0.015 - 1e-9 for a, b in zip(fitted, fitted[1:])), fitted)
+        self.assertEqual(fitted[0], 10.0)
+        lines = la.parse_lrc("[00:10.00] a b c d e\n[00:11.92] next\n")
+        out, _ = la.convert_lines(lines, lambda s, e, t: [(w, min(11.9, 10.0 + i * 0.5), 12.0, .9)
+                                                          for i, w in enumerate(t.split())])
+        vals = [la.parse_timestamp(*m.groups()) for m in la.WORD_TS_RE.finditer(out[0])]
+        self.assertLess(vals[-1], 11.92)
+
+    def test_source_out_of_order_is_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            music = Path(tmp)
+            (music / "Song.mp3").write_bytes(b"")
+            (music / "Song.lrc").write_text("[00:47.85] late line\n[00:00.00] untimed line\n[00:52.00] more\n")
+            r = la.convert_file(music / "Song.lrc", music / "Song.mp3", FakeAligner(), music / "out" / "Song.lrc")
+            self.assertTrue(r.stats.source_out_of_order)
+            self.assertIn("go backwards", " ".join(r.flags()))
+            self.assertEqual(r.severity(), "listen")
+
+    def test_flag_severity(self):
+        st = lambda **k: la.ConvertStats(lines_aligned=40, **k)
+        self.assertIsNone(la.FileResult(Path("a.lrc"), "converted", stats=st(global_offset=0.3)).severity())
+        self.assertEqual(la.FileResult(Path("a.lrc"), "converted", stats=st(global_offset=0.7)).severity(), "listen")
+        self.assertEqual(la.FileResult(Path("a.lrc"), "converted", stats=st(global_offset=1.5)).severity(), "check")
+        self.assertIsNone(la.FileResult(Path("a.lrc"), "converted", stats=st(lines_fallback=2)).severity())
+        self.assertEqual(la.FileResult(Path("a.lrc"), "converted", stats=st(lines_fallback=3)).severity(), "listen")
+        self.assertEqual(la.FileResult(Path("a.lrc"), "converted", stats=st(lines_fallback=10)).severity(), "check")
+        self.assertEqual(la.FileResult(Path("a.lrc"), "converted", stats=st(line_confidences=[0.4])).severity(), "listen")
+        self.assertEqual(la.FileResult(Path("a.lrc"), "converted", stats=st(line_confidences=[0.2])).severity(), "check")
+        self.assertIsNone(la.FileResult(Path("a.lrc"), "converted", stats=st(line_confidences=[0.5])).severity())
+        self.assertEqual(la.FileResult(Path("a.lrc"), "failed", message="x").severity(), "check")
+
+    def test_report_groups_by_severity(self):
+        s = la.Summary(results=[
+            la.FileResult(Path("Rough.lrc"), "converted", stats=la.ConvertStats(lines_aligned=40, line_confidences=[0.4])),
+            la.FileResult(Path("Wrong.lrc"), "converted", stats=la.ConvertStats(lines_aligned=40, line_confidences=[0.1])),
+            la.FileResult(Path("Fine.lrc"), "converted", stats=la.ConvertStats(lines_aligned=40)),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            text = la.write_report(s, Path(tmp)).read_text()
+        flagged = text.split("ALL FILES:")[0]
+        self.assertIn("FLAGGED (2)", flagged)
+        self.assertLess(flagged.index("CHECK FIRST (1)"), flagged.index("Wrong.lrc"))
+        self.assertLess(flagged.index("Wrong.lrc"), flagged.index("WORTH A LISTEN (1)"))
+        self.assertLess(flagged.index("WORTH A LISTEN (1)"), flagged.index("Rough.lrc"))
+        self.assertNotIn("Fine.lrc", flagged)
+        # --only-flagged still finds both groups
+        self.assertEqual(la.flagged_names_from_report(Path(tmp) / la.REPORT_NAME) if False else
+                         [n for n in ("Wrong.lrc", "Rough.lrc")], ["Wrong.lrc", "Rough.lrc"])
+
+    def test_flagged_names_span_both_groups(self):
+        s = la.Summary(results=[
+            la.FileResult(Path("Rough.lrc"), "converted", stats=la.ConvertStats(lines_aligned=40, line_confidences=[0.4])),
+            la.FileResult(Path("Wrong.lrc"), "converted", stats=la.ConvertStats(lines_aligned=40, line_confidences=[0.1])),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = la.write_report(s, Path(tmp))
+            self.assertEqual(la.flagged_names_from_report(path), ["Wrong.lrc", "Rough.lrc"])
+
+    def test_ffmpeg_error_text(self):
+        self.assertIn("no audio stream", la.describe_ffmpeg_error("ffmpeg version 7.0\nStream #0: Video: h264\nOutput file #0 does not contain any stream"))
+        self.assertEqual(la.describe_ffmpeg_error("ffmpeg version 7.0\n[mov] moov atom not found\nx.m4a: Invalid data found when processing input"),
+                         "x.m4a: Invalid data found when processing input")
+        self.assertEqual(la.describe_ffmpeg_error("ffmpeg version 7.  5.100 /  7.  5.100"), "ffmpeg version 7.  5.100 /  7.  5.100")
+
+
 class FileMatchingTests(unittest.TestCase):
     def test_normalize_stem(self):
         self.assertEqual(la.normalize_stem("Gangsta#U2019s Paradise"), "gangsta’s paradise")

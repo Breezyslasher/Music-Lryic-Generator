@@ -149,10 +149,18 @@ matching audio are skipped and listed in the log.
   field (`from-apple`). Skipped files are never touched, so re-running the
   tool changes nothing.
 - A report named `lrc_conversion_report.txt` is written to the output folder
-  after each run. It lists the files worth checking by hand first: files
-  that were shifted, lines that could not be aligned, lines with more
-  words than their time can hold (their spacing is forced, not heard), lyric
-  files with no matching audio, and failures. Then it lists every file with what was done.
+  after each run. Flagged files come first, in two groups. **Check first**
+  is for files that are probably wrong rather than rough: the aligner could
+  not follow the vocal at all (confidence under 0.3), a fifth or more of the
+  lines could not be aligned, the whole file had to be shifted by a second or
+  more, or the file failed. Nearly always that means the lyric file does not
+  match this recording (a different edit, a live version, the wrong song), and
+  a bigger model will not help. **Worth a listen** is for files that converted
+  but may be rough: confidence between 0.3 and 0.45, three or more lines that
+  could not be aligned, lines with more words than their time can hold (their
+  spacing is forced, not heard), shifts of half a second or more, or a lyric
+  file whose own line timestamps go backwards. Then every file is listed with
+  what was done.
 - A line's words are never allowed to spread further than the song's own
   pace justifies, so a held last note before an instrumental break cannot
   drag words into the break. Slow ballads keep their long lines because the
